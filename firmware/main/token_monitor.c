@@ -1,19 +1,21 @@
-/* Token monitor -- firmware stage 3: WiFi only.
+/* Token monitor -- firmware stage 4: WiFi, plus one HTTP sanity check.
  *
- * Goal of this stage, and nothing more: join the WiFi network and print the
- * IP address the router hands us over serial. No HTTP, no JSON, no display.
- * Success looks like a line reading "got IP: 192.168.1.x" in the monitor.
+ * Stage 3 (still here, unchanged) joins the WiFi network and prints the IP
+ * address the router hands us. Stage 4 adds exactly one thing on top: a
+ * single GET to a trivial, known-good web address, printing the raw response
+ * body over serial. No JSON, no display, and deliberately not pc_service yet.
  *
- * Why this is its own stage: the chip has no screen output yet, so serial is
- * the only channel for finding out what it is doing. If WiFi and HTTP and
- * parsing all went in at once, a failure anywhere would look identical --
- * "nothing on the display". Proving the network layer alone means every
- * later stage starts from a known-good foundation.
+ * Why bother with a throwaway URL instead of going straight to the real
+ * service: if the first-ever esp_http_client call were also the first-ever
+ * call to pc_service, a failure would have two suspects -- the HTTP client on
+ * this chip and IDF version, or the service on the PC (not running? firewall?
+ * wrong port?). Proving the client against something that is definitely up
+ * turns the next stage's debugging into a single-suspect problem. It also
+ * proves DNS resolution works, which pc_service (reached by raw IP) never
+ * would.
  *
- * This also retires the last unverified assumption in the network path:
- * pc_service has already been reached from a phone on this WiFi, so once
- * the chip gets an address on the same 192.168.1.x subnet, PC-to-chip
- * reachability is established end to end.
+ * Success looks like: a 200, a content length, and readable HTML between the
+ * two "---8<---" markers in the serial monitor.
  *
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED, top to bottom:
@@ -21,9 +23,10 @@
  *   1. the secrets.h guard      -- fail the build early with a clear message
  *   2. includes                 -- and what each one is actually for
  *   3. module state             -- the handful of file-scope variables
- *   4. event handlers           -- code the WiFi driver calls back into
- *   5. wifi_start()             -- one-time setup, in dependency order
- *   6. app_main()               -- the entry point; where execution begins
+ *   4. WiFi event handlers      -- code the WiFi driver calls back into
+ *   5. the HTTP sanity check    -- stage 4: its accumulator, handler, task
+ *   6. wifi_start()             -- one-time setup, in dependency order
+ *   7. app_main()               -- the entry point; where execution begins
  *
  * The control flow is NOT top-to-bottom like a script. app_main() sets things
  * up and then *sleeps*; the interesting work happens in the event handlers,
@@ -45,6 +48,9 @@
 #endif
 
 #include <string.h>                  /* memcpy, for copying credentials     */
+#include <inttypes.h>                /* PRId64 -- see the note where it is
+                                      * used; printing a 64-bit value with a
+                                      * hardcoded "%lld" is not portable      */
 
 /* FreeRTOS is the operating system underneath all of this. The ESP32 runs
  * several tasks (threads) at once -- our code, the WiFi driver, the TCP/IP
@@ -58,6 +64,7 @@
 #include "esp_event.h"               /* the event loop drivers report to    */
 #include "esp_netif.h"               /* TCP/IP stack + network interfaces   */
 #include "esp_timer.h"               /* one-shot timers, off the event loop */
+#include "esp_http_client.h"         /* stage 4: the HTTP client itself     */
 #include "esp_log.h"                 /* ESP_LOGI / ESP_LOGW / ESP_LOGE      */
 
 #include "secrets.h"                 /* YOUR values -- gitignored           */
@@ -189,6 +196,178 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
     xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
 }
 
+/* --- stage 4: the HTTP sanity check -------------------------------------- */
+
+/* A plain-HTTP address, on purpose. https:// would pull in TLS, a certificate
+ * bundle, and roughly 40 KB of extra RAM at handshake time -- none of which
+ * stage 5 needs, because pc_service serves plain HTTP on the LAN. Testing
+ * with TLS here would prove something we are not going to use, and hide the
+ * thing we are.
+ *
+ * example.com is maintained by IANA for exactly this purpose: it is stable,
+ * small, and answers plain HTTP with a 200 rather than redirecting to HTTPS.
+ * If a network hijacks it (some captive portals and ISPs do), http://neverssl.com
+ * is the usual fallback -- it exists specifically to never redirect. */
+#define SANITY_URL "http://example.com/"
+
+/* Where the response body accumulates.
+ *
+ * The body does NOT arrive in one piece: esp_http_client hands it to us in
+ * chunks as TCP segments land, calling our event handler once per chunk. That
+ * is the single most important thing this stage demonstrates, because it is
+ * exactly the shape stage 5 has to feed to cJSON -- which needs the whole
+ * document at once, not a fragment. So the handler's job is to append, and
+ * only the code after the request completes gets to look at the result. */
+typedef struct {
+    char *buf;          /* caller-owned storage                             */
+    int   cap;          /* its size in bytes, including room for the NUL    */
+    int   len;          /* bytes written so far                             */
+    bool  truncated;    /* true if the response was bigger than cap         */
+} body_buf_t;
+
+/* 4 KB holds example.com's ~1.2 KB of HTML with room to spare, and is far
+ * more than the few hundred bytes of JSON stage 5 will see. The cap exists
+ * so a surprisingly large response cannot walk off the end of the buffer:
+ * an undocumented endpoint changing its mind about response size is a real
+ * possibility, and "truncate and say so" beats both "corrupt memory" and
+ * "silently return half a document". */
+#define BODY_CAP 4096
+
+/* Called by esp_http_client at each stage of the request. Runs on whichever
+ * task called esp_http_client_perform() -- ours, below -- not on a driver
+ * task, so it is safe to log from here.
+ *
+ * Returning ESP_OK means "carry on"; returning an error aborts the request. */
+static esp_err_t on_http_event(esp_http_client_event_t *evt)
+{
+    body_buf_t *body = (body_buf_t *)evt->user_data;
+
+    switch (evt->event_id) {
+
+    /* One call per response header. Printing them is not strictly needed,
+     * but on a first run they are the proof that a real HTTP conversation
+     * happened rather than something merely returning bytes. */
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGI(TAG, "  header | %s: %s", evt->header_key, evt->header_value);
+        break;
+
+    /* One call per chunk of body. Append what fits; note if it doesn't. */
+    case HTTP_EVENT_ON_DATA: {
+        int room = body->cap - 1 - body->len;   /* -1 keeps room for a NUL */
+        int take = (evt->data_len < room) ? evt->data_len : room;
+
+        if (take > 0) {
+            memcpy(body->buf + body->len, evt->data, take);
+            body->len += take;
+            body->buf[body->len] = '\0';        /* keep it printable as a
+                                                 * C string at every step  */
+        }
+        if (take < evt->data_len) {
+            body->truncated = true;             /* reported after the call */
+        }
+        break;
+    }
+
+    default:
+        /* HTTP_EVENT_ON_CONNECTED, _HEADERS_SENT, _ON_FINISH, _DISCONNECTED,
+         * _ERROR and _REDIRECT all land here. Nothing to do for this stage;
+         * the return code from esp_http_client_perform() below already tells
+         * us whether the request as a whole worked. */
+        break;
+    }
+
+    return ESP_OK;
+}
+
+/* Performs the one request, prints the result, and deletes itself.
+ *
+ * Why this is a task rather than a few lines inside app_main: app_main runs
+ * on a task whose stack is CONFIG_ESP_MAIN_TASK_STACK_SIZE, which is 3584
+ * bytes here. esp_http_client needs appreciably more than that once lwIP and
+ * the HTTP parser are on the stack, and overflowing it produces a stack
+ * canary panic and a reboot rather than a tidy error. 8 KB is what ESP-IDF's
+ * own esp_http_client example allocates, and it is the number to start from
+ * rather than tuning downward without a measurement.
+ *
+ * A task that has finished its work must delete itself; falling off the end
+ * of a task function without calling vTaskDelete(NULL) crashes the system. */
+static void http_sanity_task(void *arg)
+{
+    /* static, so this 4 KB sits in .bss rather than on the task's stack --
+     * which we just went to some trouble to leave room in. */
+    static char storage[BODY_CAP];
+
+    body_buf_t body = { .buf = storage, .cap = sizeof(storage) };
+    body.buf[0] = '\0';
+
+    /* Fields we don't set stay zero, and zero means "the default" throughout
+     * this struct. .user_data is the pointer handed back to our event handler
+     * -- it is how the handler knows where to append without a global. */
+    esp_http_client_config_t cfg = {
+        .url           = SANITY_URL,
+        .method        = HTTP_METHOD_GET,
+        .event_handler = on_http_event,
+        .user_data     = &body,
+        .timeout_ms    = 10000,   /* 10s: generous for a LAN, and short
+                                   * enough that a black-holed connection
+                                   * fails visibly instead of hanging      */
+    };
+
+    ESP_LOGI(TAG, "stage 4: GET %s", SANITY_URL);
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "esp_http_client_init failed (out of memory?)");
+        vTaskDelete(NULL);
+        return;                  /* unreachable; states the intent clearly */
+    }
+
+    /* perform() blocks until the whole exchange finishes: DNS, connect,
+     * request, response, and every on_http_event call above. Note this is
+     * NOT wrapped in ESP_ERROR_CHECK -- a failed network request is a normal
+     * condition to report, not a reason to abort the program. That rule is
+     * the whole reason stage 8 can have a "service unreachable" screen. */
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_OK) {
+        int     status = esp_http_client_get_status_code(client);
+        int64_t clen   = esp_http_client_get_content_length(client);
+
+        /* PRId64 expands to the right length modifier for a 64-bit integer on
+         * this platform. Hardcoding "%lld" happens to work here but warns or
+         * breaks elsewhere; IDF builds with -Wall, so this is the habit. */
+        ESP_LOGI(TAG, "status %d, content-length %" PRId64 ", body %d bytes%s",
+                 status, clen, body.len,
+                 body.truncated ? " (TRUNCATED at BODY_CAP)" : "");
+
+        /* printf rather than ESP_LOGI for the body itself: the log macros
+         * prefix every call with "I (12345) token_monitor:" and colour codes,
+         * which makes multi-line HTML almost unreadable. The markers make it
+         * obvious where the body starts and stops. */
+        printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n", body.buf);
+
+        if (status != 200) {
+            ESP_LOGW(TAG, "expected 200 -- a %d still proves the client works, "
+                          "but check the URL", status);
+        }
+    } else {
+        /* esp_err_to_name turns the numeric code into something searchable,
+         * e.g. ESP_ERR_HTTP_CONNECT for a refused connection or
+         * ESP_ERR_HTTP_EAGAIN for a timeout. */
+        ESP_LOGE(TAG, "request failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "the chip has an IP, so suspect DNS, a captive portal, "
+                      "or no route off the LAN -- not the WiFi join itself");
+    }
+
+    /* Always, on both paths: cleanup frees the socket and the parser state.
+     * Skipping it leaks a few KB per request, which one request survives and
+     * stage 5's once-a-minute loop would not. */
+    esp_http_client_cleanup(client);
+
+    ESP_LOGI(TAG, "stage 4 complete. heartbeat continues; power-cycle to re-run.");
+    vTaskDelete(NULL);
+}
+
 /* --- setup -------------------------------------------------------------- */
 
 static void wifi_start(void)
@@ -313,7 +492,7 @@ void app_main(void)
      * fire -- and touch this group -- the instant the radio starts. */
     s_wifi_events = xEventGroupCreate();
 
-    ESP_LOGI(TAG, "stage 3: wifi only");
+    ESP_LOGI(TAG, "stage 4: wifi + one http sanity check");
     wifi_start();
 
     /* Block until connected. The four arguments after the group are:
@@ -329,7 +508,19 @@ void app_main(void)
     xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
-    ESP_LOGI(TAG, "connected. nothing else to do at this stage.");
+    ESP_LOGI(TAG, "connected.");
+
+    /* Only now, with a DHCP lease in hand, is it worth making a request.
+     * Association alone is not enough: the radio can be joined while DHCP is
+     * still in progress, and a GET issued then fails with no route.
+     *
+     * The five arguments to xTaskCreate are the function, a name for it (it
+     * shows up in crash dumps and task lists), the stack size in BYTES, the
+     * argument passed to the function, and the priority. 5 is above the idle
+     * task and below the WiFi driver's -- the same value ESP-IDF's own HTTP
+     * example uses. The sixth parameter would receive a handle for later
+     * control; we don't need one, because the task deletes itself. */
+    xTaskCreate(&http_sanity_task, "http_sanity", 8192, NULL, 5, NULL);
 
     /* Heartbeat, so a silent serial monitor means "the chip crashed or reset"
      * rather than leaving you guessing whether it is merely idle.

@@ -32,9 +32,18 @@ Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 
 ## Where this is in the build order
 
-**Stage 3: WiFi only** (`CLAUDE.md`'s build order) — written, flashed, and
-verified on hardware. The chip joins the network, prints its IP, and does
-nothing else. HTTP, JSON, and the display come in stages 4–8.
+**Stage 4: WiFi + one HTTP sanity check** (`CLAUDE.md`'s build order) —
+written and building clean; **not yet flashed or verified on hardware.**
+The chip joins the network, then makes a single plain-HTTP GET to
+`http://example.com/` and prints the raw response body over serial.
+
+Stage 3 (WiFi only) is done and was verified on hardware. JSON parsing, the
+real `pc_service` endpoint, and the display come in stages 5–8.
+
+The throwaway URL is the point of the stage: it proves `esp_http_client`
+works on this chip and IDF version *before* `pc_service` is in the picture,
+so a stage-5 failure has one suspect instead of two. It also proves DNS,
+which the real service — reached by raw IP — never would.
 
 `main/token_monitor.c` is commented to be read start to finish; its header
 comment maps the file and explains the one thing that trips people up, which
@@ -44,24 +53,53 @@ different task.
 
 ## What "correct" looks like right now
 
-Build, flash, and open the serial monitor. Expect:
+Build, flash, and open the serial monitor:
 
 ```
-I (…) token_monitor: stage 3: wifi only
+idf.py -p COM3 flash monitor      REM adjust the port
+```
+
+Expect roughly this, in this order:
+
+```
+I (…) token_monitor: stage 4: wifi + one http sanity check
 I (…) token_monitor: wifi started, connecting to "…"...
 I (…) token_monitor: got IP: 192.168.1.42
 I (…) token_monitor: netmask: 255.255.255.0, gateway: 192.168.1.1
-I (…) token_monitor: connected. nothing else to do at this stage.
+I (…) token_monitor: connected.
+I (…) token_monitor: stage 4: GET http://example.com/
+I (…) token_monitor:   header | Content-Type: text/html
+I (…) token_monitor:   header | Content-Length: 1256
+I (…) token_monitor: status 200, content-length 1256, body 1256 bytes
+---8<--- body ---8<---
+<!doctype html>
+<html>
+… example.com's HTML …
+</html>
+---8<--- end ----8<---
+I (…) token_monitor: stage 4 complete. heartbeat continues; power-cycle to re-run.
 I (…) token_monitor: still connected, rssi -54 dBm
 ```
 
-Two things to actually check, not just glance at:
+Four things to actually check, not just glance at:
 
 1. **The IP is on the same subnet as the PC running `pc_service`.** A
    different subnet means the chip landed on a guest network or a second AP,
    and no firewall rule will fix that.
-2. **The heartbeat keeps printing.** A monitor that goes silent means the
-   chip reset or crashed; an idle chip still logs every 10 seconds.
+2. **`status 200`**, and the body between the markers is real HTML rather
+   than empty or a fragment.
+3. **`body N bytes` matches `content-length`.** If body is smaller, the
+   response was cut off — and if the line ends in `(TRUNCATED at BODY_CAP)`,
+   it outgrew the 4 KB buffer. Neither should happen with example.com; both
+   matter, because stage 5 hands this buffer to a JSON parser that needs the
+   whole document.
+4. **The heartbeat keeps printing afterwards.** A monitor that goes silent
+   right after the request means the HTTP task crashed — most likely a stack
+   overflow, which prints a `***ERROR*** A stack overflow in task` panic just
+   before the reboot.
+
+The request runs **once**, at startup. Power-cycle or reset the board to run
+it again; stage 5 is what turns it into a repeating poll.
 
 ## Troubleshooting
 
@@ -73,6 +111,10 @@ Two things to actually check, not just glance at:
 | `disconnected (reason 205)`, intermittent | Weak signal; check the antenna is attached to the XIAO |
 | Got an IP, but on the wrong subnet | Joined the wrong network (guest WiFi / neighbouring AP) |
 | Monitor totally silent | Wrong COM port, or the chip is in bootloader mode — reset it |
+| `request failed: ESP_ERR_HTTP_CONNECT` | No route off the LAN, or DNS failed — the chip has an IP, so this is not the WiFi join |
+| `request failed: ESP_ERR_HTTP_EAGAIN` | Timed out after 10s; slow or captive-portal network |
+| A 301/302 instead of 200 | Something is redirecting plain HTTP — try `http://neverssl.com` instead |
+| Panic naming a stack overflow in `http_sanity` | The 8 KB task stack was reduced; put it back |
 
 ## Display code (stages 6-7)
 

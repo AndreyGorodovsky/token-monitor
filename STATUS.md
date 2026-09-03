@@ -4,8 +4,9 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** stages 1-3 done and verified on hardware; all code
-reviewed, fixed, and commented; stage 4 is next and deliberately not started.
+**One-line status:** stages 1-3 done and verified on hardware; stage 4
+written and building clean but **not yet flashed** — that is the next thing
+to do, before stage 5 is started.
 
 ## Done and verified
 
@@ -15,7 +16,7 @@ reviewed, fixed, and commented; stage 4 is next and deliberately not started.
 | 2 — polling service + LAN endpoint | done, verified from a phone on WiFi and under a real HTTP 429 |
 | display bring-up (GC9A01 wiring + init) | **verified on hardware** with a standalone solid-fill test; the driver still has to be brought into `firmware/` at stage 6 |
 | 3 — firmware WiFi | **done** — chip gets a lease on the same subnet as the PC |
-| 4 — HTTP client sanity check | **not started — next** |
+| 4 — HTTP client sanity check | **written, builds clean, awaiting hardware verification** |
 | 5-8 | not started |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
@@ -30,6 +31,30 @@ working on hardware by a standalone solid-colour-fill test — raw
 Registry driver: the point of the `esp_lcd` route was to avoid *writing* a
 GC9A01 driver, and a working one now exists. Revisit that only if a concrete
 need shows up (DMA-backed double-buffering, LVGL).
+
+## Stage 4 as built
+
+One plain-HTTP GET to `http://example.com/`, fired once after the DHCP lease
+arrives, printing the response headers and raw body over serial. `esp_http_client`
+was added to `REQUIRES` in `main/CMakeLists.txt`. Three decisions worth not
+re-litigating:
+
+- **It runs in its own 8 KB task, not in `app_main`.** `CONFIG_ESP_MAIN_TASK_STACK_SIZE`
+  is 3584 bytes here, and `esp_http_client` needs appreciably more than that
+  once lwIP and the HTTP parser are on the stack. Overflowing it is a stack
+  canary panic and a reboot, not an error return. 8 KB is what ESP-IDF's own
+  `esp_http_client` example uses.
+- **The body is accumulated across `HTTP_EVENT_ON_DATA` callbacks** into a
+  4 KB buffer with an explicit truncation flag. The response does not arrive
+  in one piece — this is the whole shape stage 5 has to hand to cJSON, which
+  needs a complete document.
+- **`example.com`, not the real service, and not HTTPS.** A throwaway URL
+  keeps a stage-5 failure single-suspect, and also proves DNS. HTTPS would
+  drag in TLS and a cert bundle that plain-HTTP `pc_service` will never need.
+
+Not yet verified on hardware: the board was not connected when this was
+written. Flash it and check the four points in `firmware/README.md` before
+starting stage 5.
 
 ## Facts established so far (don't re-derive)
 
@@ -105,6 +130,10 @@ need shows up (DMA-backed double-buffering, LVGL).
   with where the board sits. Workable, and it has held steady, but it is the
   weak link if the chip ever starts dropping out. Check the XIAO's antenna is
   seated before debugging anything else.
+- **The app is using most of a 1 MB partition already.** Stage 4 builds to
+  0xe3500 bytes with 11% of the app partition free. WiFi plus the HTTP client
+  is most of that, and the display driver itself is small — but if stages 6-7
+  run out of room, a custom partition table is the fix, not code golf.
 - **Flash size was wrong and is now fixed.** IDF defaulted to 2MB; the XIAO
   ESP32-C3 has 4MB, so the bootloader logged "Detected size(4096k) larger
   than the size in the binary image header(2048k)" and stranded half the
@@ -199,25 +228,20 @@ file hashes.
 
 ## Next session — start here
 
-**Stage 4: HTTP client sanity check — not started, and deliberately so.**
-Stage 4 waits until it is explicitly asked for. Don't start it off the back
-of a passing stage-3 log or a finished review.
+**Flash stage 4 and verify it**, using the four checks in
+`firmware/README.md`. It builds clean but has never run on the chip. Don't
+treat a clean build as a pass — the specific thing a build cannot catch here
+is a stack overflow in the HTTP task, which shows up only at runtime.
 
-When it is asked for: GET a trivial known endpoint with `esp_http_client` and
-print the raw body over serial, *before* pointing it at the real service, so
-an `esp_http_client` problem cannot be confused with a `pc_service` problem.
-Concretely — add `esp_http_client` to `REQUIRES` in `main/CMakeLists.txt`,
-use a plain-HTTP URL (HTTPS would drag in TLS and a cert bundle, none of
-which stage 5 needs since `pc_service` is plain HTTP on the LAN), and
-accumulate the body across `HTTP_EVENT_ON_DATA` callbacks — the response does
-not arrive in one piece, and that same shape is what stage 5 hands to cJSON.
+**Then stage 5: talk to the real `pc_service`.** It reuses the accumulator
+from stage 4 almost unchanged; what is new is the URL (from `secrets.h`'s
+`PC_SERVICE_HOST`/`PC_SERVICE_PORT`, not a literal), cJSON parsing against
+the contract in `ARCHITECTURE.md`, and handling the 503 shape as a normal
+response rather than an error. `cJSON` comes from IDF's `json` component —
+add it to `REQUIRES` the same way `esp_http_client` was.
 
-Everything stage 4 builds on is already proven: the chip connects and holds a
-lease on the same `/24` as the PC, and `pc_service` was reached from a phone
-on that WiFi. The network path needs no further proving.
-
-`pc_service` is **not running** (see Housekeeping) — it isn't needed until
-stage 5, not stage 4.
+`pc_service` must be **running** for stage 5 (see Housekeeping) — it was not
+needed for stage 4.
 
 ## Deferred, deliberately
 

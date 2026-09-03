@@ -1,0 +1,23 @@
+# Real secrets — never commit. See SECRETS.md.
+firmware/main/secrets.h
+pc_service/.env
+pc_service/config.local.*
+
+# ESP-IDF build output
+firmware/build/
+firmware/managed_components/
+firmware/dependencies.lock
+
+# Python
+pc_service/__pycache__/
+pc_service/*.pyc
+pc_service/.venv/
+
+# Local machine config — not secret, but machine-specific (absolute toolchain
+# paths, local username, COM port) and useless to anyone else.
+firmware/.vscode/
+
+# Machine-generated build config. The settings that matter live in
+# sdkconfig.defaults, which IS committed; these are regenerated from it.
+firmware/sdkconfig
+firmware/sdkconfig.old

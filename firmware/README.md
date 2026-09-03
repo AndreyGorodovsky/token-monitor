@@ -33,9 +33,9 @@ Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 ## Where this is in the build order
 
 **Stage 4: WiFi + one HTTP sanity check** (`CLAUDE.md`'s build order) —
-written and building clean; **not yet flashed or verified on hardware.**
-The chip joins the network, then makes a single plain-HTTP GET to
-`http://example.com/` and prints the raw response body over serial.
+written, flashed, and verified on hardware. The chip joins the network, then
+makes a single plain-HTTP GET to `http://example.com/` and prints the raw
+response body over serial.
 
 Stage 3 (WiFi only) is done and was verified on hardware. JSON parsing, the
 real `pc_service` endpoint, and the display come in stages 5–8.
@@ -69,8 +69,8 @@ I (…) token_monitor: netmask: 255.255.255.0, gateway: 192.168.1.1
 I (…) token_monitor: connected.
 I (…) token_monitor: stage 4: GET http://example.com/
 I (…) token_monitor:   header | Content-Type: text/html
-I (…) token_monitor:   header | Content-Length: 1256
-I (…) token_monitor: status 200, content-length 1256, body 1256 bytes
+I (…) token_monitor:   header | Transfer-Encoding: chunked
+I (…) token_monitor: status 200, content-length -1, body 559 bytes
 ---8<--- body ---8<---
 <!doctype html>
 <html>
@@ -88,11 +88,18 @@ Four things to actually check, not just glance at:
    and no firewall rule will fix that.
 2. **`status 200`**, and the body between the markers is real HTML rather
    than empty or a fragment.
-3. **`body N bytes` matches `content-length`.** If body is smaller, the
-   response was cut off — and if the line ends in `(TRUNCATED at BODY_CAP)`,
-   it outgrew the 4 KB buffer. Neither should happen with example.com; both
-   matter, because stage 5 hands this buffer to a JSON parser that needs the
-   whole document.
+3. **The body is complete** — for example.com, it ends in `</html>` — and
+   the line does not end in `(TRUNCATED at BODY_CAP)`, which would mean it
+   outgrew the 4 KB buffer. This matters because stage 5 hands the same
+   buffer to a JSON parser, which needs a whole document, not a fragment.
+
+   **`content-length -1` is not an error.** example.com is served through
+   Cloudflare with `Transfer-Encoding: chunked`, so there is no
+   `Content-Length` header at all and `esp_http_client_get_content_length()`
+   correctly reports -1. That is useful rather than annoying: chunked is the
+   case where the body definitely arrives in several pieces, so a passing run
+   proves the accumulator actually works. Treat the accumulator's own byte
+   count as the source of truth, never `content-length`.
 4. **The heartbeat keeps printing afterwards.** A monitor that goes silent
    right after the request means the HTTP task crashed — most likely a stack
    overflow, which prints a `***ERROR*** A stack overflow in task` panic just
@@ -115,6 +122,8 @@ it again; stage 5 is what turns it into a repeating poll.
 | `request failed: ESP_ERR_HTTP_EAGAIN` | Timed out after 10s; slow or captive-portal network |
 | A 301/302 instead of 200 | Something is redirecting plain HTTP — try `http://neverssl.com` instead |
 | Panic naming a stack overflow in `http_sanity` | The 8 KB task stack was reduced; put it back |
+| `Failed to connect … No serial data received` while flashing | Auto-reset into download mode did not take. Hold `B`, tap `R`, release `B`, then flash |
+| Boots to `boot:0x0 (USB_BOOT)` and `wait usb download` | Still in download mode after a manual `B`+`R` flash. Tap `R` alone — do not hold `B` — to boot the app |
 
 ## Display code (stages 6-7)
 

@@ -4,9 +4,8 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** stages 1-3 done and verified on hardware; stage 4
-written and building clean but **not yet flashed** — that is the next thing
-to do, before stage 5 is started.
+**One-line status:** stages 1-4 done and verified on hardware; stage 5
+(talk to the real `pc_service`, parse the JSON) is next.
 
 ## Done and verified
 
@@ -16,7 +15,7 @@ to do, before stage 5 is started.
 | 2 — polling service + LAN endpoint | done, verified from a phone on WiFi and under a real HTTP 429 |
 | display bring-up (GC9A01 wiring + init) | **verified on hardware** with a standalone solid-fill test; the driver still has to be brought into `firmware/` at stage 6 |
 | 3 — firmware WiFi | **done** — chip gets a lease on the same subnet as the PC |
-| 4 — HTTP client sanity check | **written, builds clean, awaiting hardware verification** |
+| 4 — HTTP client sanity check | **done** — 200 from example.com, full body over serial, heartbeat survives |
 | 5-8 | not started |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
@@ -52,9 +51,10 @@ re-litigating:
   keeps a stage-5 failure single-suspect, and also proves DNS. HTTPS would
   drag in TLS and a cert bundle that plain-HTTP `pc_service` will never need.
 
-Not yet verified on hardware: the board was not connected when this was
-written. Flash it and check the four points in `firmware/README.md` before
-starting stage 5.
+**Verified on hardware.** Status 200, all eleven response headers logged,
+559 bytes of body accumulated intact, and the heartbeat kept printing
+afterwards -- so the HTTP task neither overflowed its stack nor blocked
+anything else.
 
 ## Facts established so far (don't re-derive)
 
@@ -130,6 +130,27 @@ starting stage 5.
   with where the board sits. Workable, and it has held steady, but it is the
   weak link if the chip ever starts dropping out. Check the XIAO's antenna is
   seated before debugging anything else.
+- **example.com answers `Transfer-Encoding: chunked`** (it is served through
+  Cloudflare), so there is no `Content-Length` header and
+  `esp_http_client_get_content_length()` returns **-1**. This is not a fault,
+  and it is the more valuable test: chunked guarantees the body arrives in
+  several `HTTP_EVENT_ON_DATA` callbacks, so stage 4 passing proves the
+  accumulator genuinely works rather than getting lucky with a single-shot
+  response. **The rule for stage 5: the accumulator's own byte count is the
+  source of truth about how much body arrived; `content-length` may be -1 and
+  must never gate the parse.** (The stage-4 log line prints the raw -1; adding
+  a "(chunked)" note to it is a nice one-liner to fold into stage 5, not worth
+  a reflash on its own.)
+- **Entering download mode needed the buttons, and leaving it needs another
+  press.** A flash attempt failed repeatedly with `Failed to connect to
+  ESP32-C3: No serial data received` even though the port enumerated fine
+  (`VID_303A&PID_1001`, stable, nothing else holding it) -- neither
+  `--before default_reset` nor `--before usb_reset` could get the chip into
+  download mode. Holding `B`, tapping `R`, releasing `B` fixed it. The
+  follow-on trap: the board then boots `rst:0x15 (USB_UART_CHIP_RESET),
+  boot:0x0 (USB_BOOT)` and prints `wait usb download`, which looks like a
+  failed flash but is just the BOOT strap still low. Tapping `R` alone --
+  without `B` -- boots the app normally.
 - **The app is using most of a 1 MB partition already.** Stage 4 builds to
   0xe3500 bytes with 11% of the app partition free. WiFi plus the HTTP client
   is most of that, and the display driver itself is small — but if stages 6-7
@@ -228,12 +249,7 @@ file hashes.
 
 ## Next session — start here
 
-**Flash stage 4 and verify it**, using the four checks in
-`firmware/README.md`. It builds clean but has never run on the chip. Don't
-treat a clean build as a pass — the specific thing a build cannot catch here
-is a stack overflow in the HTTP task, which shows up only at runtime.
-
-**Then stage 5: talk to the real `pc_service`.** It reuses the accumulator
+**Stage 5: talk to the real `pc_service`.** It reuses the accumulator
 from stage 4 almost unchanged; what is new is the URL (from `secrets.h`'s
 `PC_SERVICE_HOST`/`PC_SERVICE_PORT`, not a literal), cJSON parsing against
 the contract in `ARCHITECTURE.md`, and handling the 503 shape as a normal

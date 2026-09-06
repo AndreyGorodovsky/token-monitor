@@ -153,6 +153,55 @@ panel in the right order, then it settled on solid blue and stayed there,
 with WiFi associating and the usage fetch completing on the same boot. So
 SPI and the WiFi radio coexist, which was the actual open question.
 
+### Review pass on the driver — three fixes
+
+A review of the stage-6 diff found three real issues, all fixed:
+
+- **Every SPI transfer's return value was discarded.** `gc9a01.h` promised
+  `ESP_ERROR_CHECK` semantics, but that only covered bus setup; the two
+  functions that actually put bytes on the wire ignored their `esp_err_t`.
+  Not theoretical: `spi_device_polling_transmit` → `spi_device_polling_start`
+  → `setup_priv_desc`, and that last one bounce-allocates with
+  `heap_caps_aligned_alloc` whenever the source is not DMA-capable. The init
+  table is `static const`, so it lives in flash-mapped rodata, which is *not*
+  DMA-capable — **all 42 init payloads take that path**. Under heap pressure
+  a parameter silently never reaches the panel and the driver still logs
+  "init done" over a half-configured display. Both writers now funnel through
+  one checked `lcd_transmit`, which records the first failure (sticky, so a
+  broken bus cannot print 240 identical lines during one fill), and
+  `gc9a01_init` ends with `ESP_ERROR_CHECK(s_err)` — which is what makes the
+  header's promise true. Drawing calls deliberately log instead of aborting:
+  a desk gadget that panics over one bad row is worse than one showing a
+  partial screen.
+- **`gc9a01_init()` was not idempotent.** `spi_bus_initialize` returns
+  `ESP_ERR_INVALID_STATE` for an already-initialized host, inside
+  `ESP_ERROR_CHECK` — so a second call panicked and rebooted rather than
+  no-opping. Nothing calls it twice today, but stage 8 adds recovery paths
+  where re-initializing the panel is an easy mistake, and the cost of that
+  mistake was a boot loop. Now a logged no-op. **Verified by deliberately
+  calling it twice on hardware**: warning printed, no panic, display
+  unaffected.
+- **The `max_transfer_sz` comment was misleading.** It read as a cap of one
+  480-byte row; `spi_bus_initialize` actually passes it to
+  `spicommon_dma_desc_alloc`, which rounds up to whole DMA descriptors and
+  writes the larger value back. Corrected, because stage 7 will size
+  multi-row transfers and — before the fix above — exceeding the real cap
+  would have failed silently.
+
+**One finding was investigated and deliberately not acted on.** CS sits on
+GPIO8, which is an ESP32-C3 strapping pin that must read high to enter
+download mode, and this module has an onboard pull-down on CS. The prediction
+was that flashing would need the manual button dance. It does not: **five
+consecutive `idf.py flash` runs with the panel wired all entered download
+mode normally**, so the pull-down is too weak to win at reset. The facts are
+still worth having, because they are a credible explanation for the one
+`No serial data received` failure recorded at stage 4 — and would explain why
+it was intermittent. Documented at the `#define`, with the two cheap outs
+(move CS to D10/GPIO10, or leave it unwired — the module works without it,
+being the only device on the bus) noted as available if it ever recurs.
+Rewiring a proven-good setup to fix a symptom that is not occurring would be
+the wrong trade.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.

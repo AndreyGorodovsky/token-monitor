@@ -42,15 +42,24 @@
 #define GC9A01_BLUE    0x001F
 
 /* Configures the SPI bus, resets the panel, and sends the vendor power-on
- * sequence. Call once, before anything else here.
+ * sequence. Call once, before anything else here; a second call logs a
+ * warning and returns rather than re-initializing (or panicking).
  *
- * Aborts on failure via ESP_ERROR_CHECK, which is the right call for setup:
- * a bad SPI configuration is a programming mistake, not a runtime condition
- * to degrade around. (Network calls in this project are handled the opposite
- * way, and for the opposite reason.) Note that a *wiring* fault cannot be
- * detected here at all -- SPI writes are unacknowledged, so this function
- * succeeds just as cheerfully into a disconnected panel. */
+ * Aborts on failure via ESP_ERROR_CHECK -- covering both the bus setup and
+ * every byte of the init sequence. That is the right call for setup: a bad
+ * SPI configuration is a programming mistake, and a panel that was only
+ * half-configured has no meaningful state to continue from. (Network calls in
+ * this project are handled the opposite way, and for the opposite reason.)
+ *
+ * What it cannot detect is a *wiring* fault. SPI writes are unacknowledged,
+ * so this function succeeds just as cheerfully into a disconnected panel:
+ * only your eyes can confirm that part. */
 void gc9a01_init(void);
 
-/* Fills all 240x240 pixels with one colour. */
+/* Fills all 240x240 pixels with one colour.
+ *
+ * Unlike init, a failed transfer here is logged (once) and not fatal. A desk
+ * gadget that panics because one row of pixels did not go out is worse than
+ * one showing a stale or partial screen -- and stage 8's whole job is to
+ * degrade visibly rather than die. */
 void gc9a01_fill_screen(uint16_t color565);

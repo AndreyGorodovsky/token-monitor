@@ -44,7 +44,26 @@ static const char *TAG = "gc9a01";
 #define PIN_MOSI GPIO_NUM_5   /* D3 -- SDA */
 #define PIN_RST  GPIO_NUM_6   /* D4 -- RES */
 #define PIN_DC   GPIO_NUM_7   /* D5 -- DC  */
-#define PIN_CS   GPIO_NUM_8   /* D8 -- CS  */
+
+/* CS is on GPIO8, and GPIO8 is one of the ESP32-C3's three strapping pins
+ * (with GPIO2 and GPIO9): it has to read HIGH at reset for the chip to enter
+ * download mode. This display module carries an onboard pull-down on CS (R8,
+ * per its silkscreen), which pulls that same line the wrong way.
+ *
+ * In practice it has not blocked flashing -- repeated `idf.py flash` runs with
+ * the panel wired have entered download mode normally, so the pull-down is
+ * evidently too weak to win at reset. But it is the leading suspect if flashing
+ * ever fails with `Failed to connect ... No serial data received`, which has
+ * happened once on this board and was worked around with hold-B/tap-R/release-B
+ * (recorded in STATUS.md). It would explain why that was intermittent rather
+ * than constant.
+ *
+ * If it becomes a recurring nuisance there are two cheap outs, and neither is
+ * urgent enough to disturb a proven-good wiring today: move CS to a
+ * non-strapping pin (D10/GPIO10 is unused here), or leave CS disconnected
+ * entirely -- the module's own documentation says it works unwired, this being
+ * the only device on the bus. */
+#define PIN_CS   GPIO_NUM_8   /* D8 -- CS; see the strapping note above */
 
 /* Conservative, and deliberately not raised yet. Many GC9A01 boards run
  * happily at 40 MHz, and stage 7 will want the extra speed once it is redrawing
@@ -56,7 +75,52 @@ static const char *TAG = "gc9a01";
 
 static spi_device_handle_t s_spi;
 
-/* --- the only two ways anything reaches the panel ------------------------ */
+/* First SPI failure since boot, or ESP_OK. Sticky, and deliberately so.
+ *
+ * It is tempting to treat SPI writes as something that cannot fail -- the
+ * panel never answers, so nothing on the wire can report a problem. But the
+ * *host side* can still fail before a byte is ever clocked out, and that is
+ * worth knowing about: see lcd_transmit for the specific case that bites here.
+ *
+ * Recording the first failure rather than the latest, and logging only that
+ * one, keeps a broken bus from printing 240 identical lines during a single
+ * screen fill while still making the failure impossible to miss. */
+static esp_err_t s_err = ESP_OK;
+
+/* --- the one place any byte reaches the panel ---------------------------- */
+
+/* Every command and every pixel goes through here, so this is the single
+ * place that has to get error handling right.
+ *
+ * polling_transmit rather than the queued/interrupt form: it busy-waits for
+ * the transfer instead of blocking on a semaphore, which is faster for the
+ * short bursts this driver sends and keeps the call order obvious. A
+ * full-screen fill is 240 of these back to back.
+ *
+ * Its return value is NOT ignorable, which is easy to assume it is. The path
+ * is spi_device_polling_transmit -> spi_device_polling_start ->
+ * setup_priv_desc, and that last one allocates a bounce buffer with
+ * heap_caps_aligned_alloc whenever the source is not DMA-capable. Our init
+ * table is `static const`, so it lives in flash-mapped rodata, which is not
+ * DMA-capable -- meaning all 42 init payloads take exactly that path. Under
+ * heap pressure the allocation fails, that init parameter never reaches the
+ * panel, and without this check the driver would cheerfully log "init done"
+ * over a half-configured display showing washed-out or garbled colour. */
+static void lcd_transmit(const uint8_t *bytes, size_t len)
+{
+    spi_transaction_t t = {
+        .length    = len * 8,    /* in BITS, not bytes -- a classic slip */
+        .tx_buffer = bytes,
+    };
+
+    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
+    if (err != ESP_OK && s_err == ESP_OK) {
+        s_err = err;
+        ESP_LOGE(TAG, "SPI transfer of %u bytes failed: %s "
+                      "(further failures suppressed)",
+                 (unsigned)len, esp_err_to_name(err));
+    }
+}
 
 /* Command vs. data is not two different wires or two different transactions:
  * it is which state the DC pin is in when the byte lands on the bus. Hence a
@@ -65,11 +129,7 @@ static spi_device_handle_t s_spi;
 static void lcd_cmd(uint8_t cmd)
 {
     gpio_set_level(PIN_DC, 0);
-    spi_transaction_t t = {
-        .length    = 8,          /* in BITS, not bytes -- a classic slip */
-        .tx_buffer = &cmd,
-    };
-    spi_device_polling_transmit(s_spi, &t);
+    lcd_transmit(&cmd, 1);
 }
 
 static void lcd_data(const uint8_t *data, size_t len)
@@ -78,15 +138,7 @@ static void lcd_data(const uint8_t *data, size_t len)
         return;                  /* several init entries carry no payload */
     }
     gpio_set_level(PIN_DC, 1);
-    spi_transaction_t t = {
-        .length    = len * 8,
-        .tx_buffer = data,
-    };
-    /* polling_transmit rather than the queued/interrupt form: it busy-waits
-     * for the transfer instead of blocking on a semaphore, which is faster for
-     * the short bursts this driver sends and keeps the call order obvious.
-     * A full-screen fill is 240 of these back to back. */
-    spi_device_polling_transmit(s_spi, &t);
+    lcd_transmit(data, len);
 }
 
 static void lcd_reset(void)
@@ -171,7 +223,15 @@ static void spi_init(void)
         .sclk_io_num     = PIN_SCLK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = GC9A01_WIDTH * 2,   /* one row of RGB565 pixels */
+        /* The largest transfer we intend to make: one row of RGB565 pixels.
+         *
+         * Read this as a hint, not as the limit that will actually apply.
+         * spi_bus_initialize passes it to spicommon_dma_desc_alloc, which
+         * rounds it up to a whole number of DMA descriptors and writes the
+         * larger figure back -- in practice a few KB, not 480 bytes. So do not
+         * size a future multi-row transfer against this number in either
+         * direction: it is neither the real cap nor a promise. */
+        .max_transfer_sz = GC9A01_WIDTH * 2,
     };
     /* SPI2_HOST is the general-purpose SPI peripheral on the ESP32-C3 (SPI0
      * and SPI1 are spoken for by the flash chip -- do not use them). */
@@ -189,6 +249,20 @@ static void spi_init(void)
 
 void gc9a01_init(void)
 {
+    /* Calling this twice is a programming error, but it must not be a fatal
+     * one. spi_bus_initialize() returns ESP_ERR_INVALID_STATE for an already
+     * initialized host, and it is wrapped in ESP_ERROR_CHECK below -- so
+     * without this guard a second call would panic and reboot the chip. That
+     * is a poor trade: stage 8 adds reconnect and recovery paths, and
+     * re-initializing the display from one of them is an easy mistake to
+     * make. Turning a redundant call into a logged no-op keeps a cosmetic
+     * slip from becoming a boot loop. */
+    static bool s_inited = false;
+    if (s_inited) {
+        ESP_LOGW(TAG, "gc9a01_init() called more than once -- ignoring");
+        return;
+    }
+
     /* DC and RST are plain outputs we drive by hand. CS is not configured
      * here on purpose -- the SPI driver claims that pin itself. */
     gpio_config_t io_conf = {
@@ -236,6 +310,16 @@ void gc9a01_init(void)
     lcd_cmd(0x29);                /* display on */
     vTaskDelay(pdMS_TO_TICKS(20));
 
+    /* This is what makes the header's promise true. Without it, a transfer
+     * that never left the host would be logged and then walked straight past,
+     * and "init done" would print over a half-configured panel -- the exact
+     * silent-wrong-state this project keeps trying to avoid. Aborting is right
+     * *here*, in setup: there is no meaningful way to continue from a display
+     * that was not configured. Drawing calls take the opposite view, and say
+     * why in gc9a01.h. */
+    ESP_ERROR_CHECK(s_err);
+
+    s_inited = true;
     ESP_LOGI(TAG, "init done");
 }
 

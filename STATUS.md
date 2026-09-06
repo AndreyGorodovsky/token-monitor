@@ -509,6 +509,15 @@ Four things worth knowing before starting:
   Stage 7 draws that flag. An indicator that cries wolf a third of the time
   is one you learn to ignore, and then it fails to tell you the thing it
   exists for — that the PC is asleep or the service is dead.
+
+  **Verified after the change: 7 consecutive polls over 13 minutes, zero
+  429s**, against roughly 2 rejections that the old cadence would have
+  produced in the same span. The run also settled the freshness question by
+  accident — the served numbers were identical across six of those seven
+  polls (5h 53%, 7d 6% for twelve minutes straight), so even 120s is asking
+  faster than the data changes. Caveat kept deliberately: this is one
+  account over one hour during an active Claude Code session, so it is a
+  step that fits the evidence, not a measured limit.
 - **The PC must be on.** Known v1 limitation; a future server/cloud relay
   would replace only the credential-reading layer. See `ARCHITECTURE.md`.
 - **Expressive face on the display, instead of numbers alone.** Requested

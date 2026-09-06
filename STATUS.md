@@ -680,11 +680,19 @@ the easy path. When writing up a network finding here, describe the property
 LAN addresses and local filesystem paths: name the role, not the value.
 
 `pc_service` is **not running** — it is stopped at the end of each session.
-Nothing consumes it until the firmware talks to it. Restart with:
+Restart it before any firmware work from stage 5 onward, which is now all of
+it:
 
 ```
 cd pc_service && python service.py
 ```
 
 Confirm only one instance runs; a duplicate launch fails loudly at bind time
-rather than silently double-polling.
+rather than silently double-polling. It polls every **120s** (raised from 60s
+after persistent 429s — see the deferred list), so the first reading can take
+up to two minutes to appear; until then `/usage` answers 503 and the chip
+shows `NO DATA`, both of which are correct behaviour rather than faults.
+
+**The chip keeps running whether or not the service does.** With the service
+stopped it displays `NO LINK` after a ten-second timeout, which is the
+expected picture between sessions and not something to debug.

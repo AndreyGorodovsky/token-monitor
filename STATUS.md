@@ -4,8 +4,9 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** stages 1-6 done and verified on hardware; stage 7
-(render the real values through the now-working display) is next.
+**One-line status:** stages 1-7 done and verified on hardware; stage 8
+(periodic refresh, reconnect handling, considered failure states) is next —
+and is the last one.
 
 ## Done and verified
 
@@ -17,8 +18,9 @@ design) to resume cold.
 | 3 — firmware WiFi | **done** — chip gets a lease on the same subnet as the PC |
 | 4 — HTTP client sanity check | **done** — 200 from example.com, full body over serial, heartbeat survives |
 | 5 — talk to the real `pc_service` | **done** — 200, parsed, values match what the PC serves field for field |
-| 6 — display inside `firmware/` | **done** — red/green/blue cycle correct on the panel, resting on blue, alongside a running WiFi radio |
-| 7-8 | not started |
+| 6 — display inside `firmware/` | **done** — red/green/blue cycle correct on the panel, alongside a running WiFi radio |
+| 7 — real values on the screen | **done** — both readings, reset times and colour bands legible on the panel |
+| 8 | not started |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
 `service.py` (poll + cache + `GET /usage`). Pure stdlib, no venv.
@@ -202,6 +204,59 @@ being the only device on the bus) noted as available if it ever recurs.
 Rewiring a proven-good setup to fix a symptom that is not occurring would be
 the wrong trade.
 
+## Stage 7 as built
+
+The join: `usage_t` from stage 5, drawn with the panel from stage 6. Three
+pieces of new machinery, all small.
+
+- **A font, as reviewable art rather than hex.** `tools/make_font.py` holds
+  each glyph as seven rows of five characters and generates
+  `main/font5x7.h`; both are committed, so building never needs Python. The
+  reason for the indirection is that a wrong bit in hand-written hex is
+  invisible until it is on the glass and you are wondering why the 8 looks
+  odd — as art, it is wrong in a way you can see. The generator refuses to
+  emit a malformed glyph and prints a preview.
+- **`gc9a01_fill_rect` and text**, both built on the same address-window
+  idea as `fill_screen` — set a rectangle, stream pixels into it. A
+  character is one window per glyph, magnified by an integer `scale`, which
+  is why one 295-byte table serves every size on screen. `fill_screen` is
+  now just `fill_rect` over the whole panel, so there is a single fill path.
+- **A layout in named constants**, because the recurring question on a round
+  display is "does this still fit inside the circle", and that is far easier
+  to answer from a list of rows than from numbers buried in draw calls.
+
+Every fetch outcome now reaches the screen, not just the good one: 200
+renders the readings, 503 shows `NO DATA`, a connection failure shows
+`NO LINK`, and a bad body shows `BAD DATA`. These are the minimum that stops
+the display from *lying* — stage 8 makes them considered states rather than
+one-line messages. `CONNECTING` replaces stage 6's resting blue, since a
+twenty-second WiFi join behind a blank screen looks broken.
+
+**Cost: 1,552 bytes** for the font, the primitives and the layout together.
+Worth recording because font data was flagged earlier as a threat to the
+flash budget, and at this size it plainly is not. The budget pressure is
+real for *stored images*, which is the deferred face idea, and not for text.
+
+**Verified on hardware, by eye** — the only way it can be. Both readings,
+both reset times, the divider and the colour bands, legible across a desk.
+
+### The one real bug: everything was mirrored
+
+The first render came out mirrored left to right. The cause was `madctl`,
+corrected from `0x08` to `0x48` (adding the MX column-order bit), and the
+interesting part is why it survived six stages undetected: **a solid-colour
+fill is symmetric, so no amount of it can reveal orientation.** The
+bring-up test proved the colour order — that half was and remains correct —
+and was structurally incapable of proving anything about scan direction. The
+note in this file claiming `0x08` was "right for this board, no calibration
+step needed" has been corrected accordingly.
+
+Two things to take from it. A test proves what it exercises and nothing
+adjacent, and it is worth asking what a passing test is *blind* to rather
+than only what it covers. And the staged build worked exactly as intended
+here: the bug was found the moment the first stage capable of exposing it
+ran, with one suspect and a one-byte fix.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -241,9 +296,20 @@ the wrong trade.
 - **GC9A01 pinout in use (confirmed working):** GND→GND, VCC→3.3V-OUT,
   SCL→D2/GPIO4, SDA→D3/GPIO5, RES→D4/GPIO6, DC→D5/GPIO7, CS→D8/GPIO8. Full
   table and rationale in `ARCHITECTURE.md`.
-- **GC9A01 color order confirmed correct as-shipped** — a red/green/blue
-  cycle showed true colors, no swap. `madctl = 0x08` is right for this
-  board; carry it into `firmware/` unchanged, no calibration step needed.
+- **`madctl` is `0x48` (MX | BGR), and the story of how it got there is the
+  useful part.** It was `0x08` from bring-up through stage 6, on the evidence
+  of a red/green/blue fill test that showed true colours — so the colour half
+  of that finding was right and still stands. But **a solid fill is symmetric,
+  and therefore blind to orientation.** The first asymmetric thing ever drawn
+  on this panel — text, at stage 7 — came out mirrored left to right, which is
+  the MX bit (`0x40`). The earlier note here said "right for this board, no
+  calibration step needed"; that overstated what the test could possibly have
+  shown, which is the thing worth remembering. A test proves what it exercises,
+  and nothing adjacent.
+
+  The full byte: `0x80` MY flips vertically, `0x40` MX flips horizontally,
+  `0x20` MV rotates 90°, `0x08` selects BGR. If orientation ever needs
+  revisiting, those four bits are the whole search space.
 - **Watch out for more than one ESP-IDF install on the same machine.** This
   build has been developed against ESP-IDF **v5.3.5**, pinned locally through
   the VS Code extension's `idf.currentSetup` setting (`firmware/.vscode/` is
@@ -462,31 +528,39 @@ file hashes.
 
 ## Next session — start here
 
-**Stage 7: render the real values through the working display.** Both halves
-now exist and are proven separately — `usage_t` is filled in from the network
-at stage 5, and the panel takes solid fills at stage 6. Stage 7 is the join:
-drawing primitives on top of `gc9a01_fill_screen`'s address-window mechanism
-(a rectangle fill is the same code with different bounds), then text.
+**Stage 8: polish — and it is the last stage.** Three things, per
+`CLAUDE.md`'s definition of done: a periodic refresh every 30-60s, WiFi
+reconnect handling, and a visible fallback when the service or network drops.
+
+What is already in place: every fetch outcome already reaches the screen
+(`NO LINK`, `NO DATA`, `BAD DATA`), the reconnect timer already retries
+forever without blocking the event loop, and `gc9a01_fill_rect` already
+exists for partial redraws. So stage 8 is mostly turning one-shot code into
+a loop and making the failure states considered rather than minimal.
 
 Four things worth knowing before starting:
 
-- **Text needs a font, and a font is data.** There is no text rendering in
-  the driver and nothing in IDF to borrow, so stage 7 either embeds a small
-  bitmap font or draws digits from segments. Whatever it is, it lands in the
-  74 KB of app partition still free — check `idf.py size` before and after.
-- **The panel is round.** The framebuffer is the full 240x240 square, and the
-  controller will happily take pixels in the corners that no one can see.
-  Anything that matters belongs inside the inscribed circle.
-- **A full-screen fill is 240 SPI transfers at 10 MHz.** Fine for stage 6's
-  once-at-boot cycle, and the reason stage 7 should redraw only the regions
-  that changed rather than repainting everything each refresh. Raising the
-  clock toward 40 MHz is the other half of that, and is worth doing as its
-  own change with the screen already working.
-- **Land on a layout rather than perfecting one** — `CLAUDE.md` says so
-  explicitly, and there is a deferred idea (the expressive face, below) that
-  will want to revisit the layout anyway once the free-flash number is known.
+- **Reset the accumulator each time round the loop.** `body.len` and
+  `body.truncated` are initialised once per task run today. In a loop, the
+  second response would append to the first and cJSON would see garbage.
+  This has been the known trap since stage 5.
+- **Do not repaint the whole screen every refresh.** `render_usage` currently
+  fills black and redraws everything, which is fine once at boot and will
+  visibly flash once a minute. `fill_rect` over just the changed field is the
+  fix; what is missing is remembering what was drawn last.
+- **Drawing must stay on one task.** `gc9a01` is not thread-safe and nothing
+  guards it. Today app_main draws only before creating the fetch task. A
+  refresh loop must not break that, or it needs a lock.
+- **`updated_epoch` vs `now_epoch` is the real staleness signal**, and stage 8
+  is where it becomes a decision rather than a printed number: at some age,
+  numbers should stop being shown as if current. The `stale` flag from the
+  service is the other half of that.
 
-`pc_service` must be **running** for stage 7, as it was for stage 5.
+Two smaller candidates, neither required: raise the SPI clock from 10 MHz
+toward 40 MHz (worth doing on its own, with the screen already working), and
+the deferred expressive-face idea below, now that the flash budget is known.
+
+`pc_service` must be **running** for stage 8.
 
 ## Deferred, deliberately
 

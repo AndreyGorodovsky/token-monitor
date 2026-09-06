@@ -41,6 +41,23 @@
 #define GC9A01_GREEN   0x07E0
 #define GC9A01_BLUE    0x001F
 
+/* Any other colour, from ordinary 8-bit components. The low bits are simply
+ * dropped -- 8:8:8 does not fit in 5:6:5 -- so nearby shades collapse
+ * together, which matters for gradients and not at all for flat UI colour. */
+#define GC9A01_RGB(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | \
+                                        (((g) & 0xFC) << 3) | \
+                                        (((b) & 0xF8) >> 3)))
+
+/* Text metrics. The font is 5x7 with a one-pixel spacer column baked into the
+ * advance, so a character cell is 6x7 and a string of n characters occupies
+ * n*6*scale pixels including the trailing spacer. `scale` is an integer pixel
+ * multiplier: scale 1 is 5x7, scale 5 is a 25x35 glyph in a 30x35 cell.
+ * Integer scaling keeps the font a single 295-byte table instead of one table
+ * per size, at the cost of visible blockiness at large scales. */
+#define GC9A01_CHAR_W          6
+#define GC9A01_CHAR_H          7
+#define GC9A01_MAX_TEXT_SCALE  8
+
 /* Configures the SPI bus, resets the panel, and sends the vendor power-on
  * sequence. Call once, before anything else here; a second call logs a
  * warning and returns rather than re-initializing (or panicking).
@@ -61,5 +78,37 @@ void gc9a01_init(void);
  * Unlike init, a failed transfer here is logged (once) and not fatal. A desk
  * gadget that panics because one row of pixels did not go out is worse than
  * one showing a stale or partial screen -- and stage 8's whole job is to
- * degrade visibly rather than die. */
+ * degrade visibly rather than die. The same applies to everything below. */
 void gc9a01_fill_screen(uint16_t color565);
+
+/* Fills a rectangle. Clipped to the panel, so partly- or wholly-offscreen
+ * rectangles are safe and simply draw less.
+ *
+ * This is also the primitive that makes partial redraws possible: repainting
+ * only the region that changed, rather than the whole screen, is what keeps a
+ * once-a-minute refresh from visibly flashing. */
+void gc9a01_fill_rect(int x, int y, int w, int h, uint16_t color565);
+
+/* Draws text with an opaque background, top-left anchored at (x, y).
+ *
+ * Opaque rather than transparent on purpose: it means redrawing a changed
+ * value over its old one needs no separate clear step, and so cannot flicker
+ * between the two.
+ *
+ * Lowercase input is mapped to uppercase -- the table holds one case, which
+ * halves it, and this display shows numbers and short labels. Characters with
+ * no glyph (punctuation outside the table, or any byte of a multi-byte UTF-8
+ * sequence -- a non-English weekday abbreviation from the PC, for instance)
+ * draw as a conspicuous box, so a text problem looks like a text problem.
+ *
+ * NOT clipped, unlike fill_rect: a character that would fall outside the panel
+ * is skipped entirely rather than half-drawn. Position text within bounds.
+ * `scale` is clamped to 1..GC9A01_MAX_TEXT_SCALE, since it sizes a fixed
+ * internal buffer. */
+void gc9a01_draw_text(int x, int y, const char *text,
+                      uint16_t fg565, uint16_t bg565, int scale);
+
+/* Width in pixels of `text` at `scale`, excluding the trailing spacer column,
+ * so that centring on it looks centred. Height is always
+ * GC9A01_CHAR_H * scale. */
+int gc9a01_text_width(const char *text, int scale);

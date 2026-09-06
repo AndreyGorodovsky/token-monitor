@@ -33,14 +33,19 @@ Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 
 ## Where this is in the build order
 
-**Stage 6: display bring-up** (`CLAUDE.md`'s build order) — written, flashed,
-and verified on hardware. On boot the chip now initializes the GC9A01 panel
-and cycles it through red, green and blue before resting on solid blue; then
-stage 5's WiFi join and usage fetch run as before, printing parsed values over
-serial. Nothing from the network reaches the screen yet — that join is stage 7.
+**Stage 7: the usage numbers, on the screen** (`CLAUDE.md`'s build order) —
+written, flashed, and verified on hardware. This is where the project does the
+thing it exists for: the chip initializes the panel, joins WiFi, fetches the
+usage JSON, and renders it, so the gadget is readable with no serial monitor
+attached.
 
-Stages 3 (WiFi), 4 (HTTP to a throwaway URL) and 5 (the real service, parsed
-with cJSON) are done and were verified on hardware.
+Stages 3 (WiFi), 4 (HTTP to a throwaway URL), 5 (the real service, parsed with
+cJSON) and 6 (panel bring-up) are all done and verified on hardware.
+
+It still draws **once**, at boot. The refresh loop, reconnect handling and
+considered failure states are stage 8 — the failure screens here are the
+minimum that keeps the display from showing something untrue, not the finished
+design.
 
 Stage 4's throwaway URL was the point of *that* stage: it proved
 `esp_http_client` works on this chip and IDF version before `pc_service` was
@@ -71,14 +76,14 @@ idf.py -p COM3 flash monitor      REM adjust the port
 Expect roughly this, in this order:
 
 ```
-I (…) token_monitor: stage 6: display bring-up
+I (…) token_monitor: stage 7: usage on the display
 I (…) gc9a01: hardware reset...
 I (…) gc9a01: sending 42 vendor init commands...
 I (…) gc9a01: init done
 I (…) token_monitor:   fill: RED
 I (…) token_monitor:   fill: GREEN
 I (…) token_monitor:   fill: BLUE
-I (…) token_monitor: display ready (screen should now be solid BLUE and stay that way)
+I (…) token_monitor: display ready
 I (…) token_monitor: stage 5: wifi + one fetch of the real usage JSON
 I (…) token_monitor: wifi started, connecting to "…"...
 I (…) token_monitor: got IP: 192.168.1.42
@@ -94,17 +99,31 @@ I (…) token_monitor: status 200, content-length 278, body 278 bytes
   updated 12:29   stale: no
   data age: 20s by the PC's clock
 ---8<--- end ------8<---
-I (…) token_monitor: stage 5 passed: the JSON contract works end to end
+I (…) token_monitor: stage 7: rendered to the display
 I (…) token_monitor: stage 5 complete. heartbeat continues; power-cycle to re-run.
 I (…) token_monitor: still connected, rssi -62 dBm
 ```
 
 Five things to actually check, not just glance at:
 
-1. **The screen actually cycles red, green, blue and stays blue.** This is
-   the only check here that the serial log cannot make for you: SPI writes are
-   unacknowledged, so every line above prints identically into a panel that is
-   not plugged in.
+1. **The screen shows the readings, and shows them the right way round.**
+   This is the only check here the serial log cannot make for you: SPI writes
+   are unacknowledged, so every line above prints identically into a panel that
+   is not plugged in — or into one drawing everything mirrored, which is
+   exactly what happened the first time stage 7 ran. Expect:
+
+   ```
+           5-HOUR          dim grey label
+            63%            large, colour-banded
+           17:10           reset time
+         ──────────
+           7-DAY
+             7%
+         THU 19:00
+   ```
+
+   Colour bands are green under 50%, amber to 80%, red above. A `STALE` badge
+   appears under the second reading only when the data is not current.
 2. **The IP is on the same subnet as the PC running `pc_service`.** A
    different subnet means the chip landed on a guest network or a second AP,
    and no firewall rule will fix that.
@@ -134,6 +153,23 @@ Five things to actually check, not just glance at:
 The request runs **once**, at startup. Power-cycle or reset the board to run
 it again; stage 8 is what turns it into a repeating poll.
 
+## The font (`tools/make_font.py`)
+
+Text needs glyph data, and glyph data written straight into C as hex is
+unreviewable — a wrong bit is invisible until it is on the glass. So the font
+lives as ASCII art in `tools/make_font.py`, which generates `main/font5x7.h`.
+Both are committed, so **building never requires Python**; run the script only
+when changing a glyph:
+
+```
+python tools/make_font.py
+```
+
+It refuses to emit a malformed glyph and prints a preview of the whole set. The
+table is uppercase-only (the draw code folds lowercase) and covers ASCII 32-90
+in 295 bytes; anything it cannot represent draws as a conspicuous box, so a
+text problem looks like a text problem rather than a gap.
+
 A **503** is a normal answer, not a failure of the firmware: it means
 `pc_service` is up but has never completed a poll (just started, or being
 rate-limited upstream), so it has no data to serve even as stale. The
@@ -145,7 +181,8 @@ data" screen.
 | Symptom | Likely cause |
 |---|---|
 | Screen completely dark, no backlight glow | Power, not signal — check GND/VCC against the board's silkscreen first. The backlight is tied straight to VCC with no control pin, so a power fault is *total* darkness, and the serial log stays clean regardless |
-| Screen lit but colours wrong or inverted | Calibration, not wiring: `madctl` in `gc9a01.c` (try `0x00` or `0x48`), or the inversion command `0x21` |
+| Screen lit but colours wrong or inverted | Calibration, not wiring: the BGR bit (`0x08`) of `madctl` in `gc9a01.c`, or the inversion command `0x21` |
+| Text mirrored, upside down, or rotated | Also `madctl`, but the scan-direction bits rather than colour: `0x40` MX flips horizontally, `0x80` MY vertically, `0x20` MV rotates 90°. Solid-colour tests cannot reveal this — only asymmetric content can |
 | Screen lit but streaky, noisy, or partial | Signal integrity — most likely the 10 MHz SPI clock over long jumper wires, or a loose SCL/SDA/DC line |
 | Build error naming `secrets.h` | You haven't copied `secrets.h.example` to `secrets.h` yet |
 | `disconnected (reason 201)` repeating | AP not found — wrong SSID, or the network is 5 GHz only |
@@ -167,7 +204,7 @@ data" screen.
 
 Hand-rolled on plain `spi_master` + `gpio` — no `esp_lcd`, no Component
 Registry dependency, nothing to download. The init sequence and
-`madctl = 0x08` are confirmed correct on this panel. See
+`madctl = 0x48` are confirmed correct on this panel. See
 `../ARCHITECTURE.md` for the pinout and the reasoning.
 
 The interface is two functions wide on purpose (`gc9a01_init`,
@@ -191,7 +228,7 @@ Three colours rather than one, and it rests **lit** rather than black. Both
 are deliberate. A single fill could be a screen stuck on a colour from a
 previous run, whereas a sequence proves the chip is genuinely driving the
 panel — and that red, green and blue arrive as red, green and blue, which is
-what confirms `madctl = 0x08`. Resting on blue matters because a black screen
+what confirms the BGR half of `madctl`. Resting on blue matters because a black screen
 and a *dead* screen look identical, so the resting state would otherwise
 prove nothing to anyone who missed the cycle.
 

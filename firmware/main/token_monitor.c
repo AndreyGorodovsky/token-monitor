@@ -1,25 +1,21 @@
-/* Token monitor -- firmware stage 5: fetch the real usage JSON and parse it.
+/* Token monitor -- firmware stage 7: the usage numbers, on the screen.
  *
- * Stage 3 (still here, unchanged) joins the WiFi network and prints the IP
- * address the router hands us. Stage 4 proved esp_http_client works on this
- * chip by GETting a throwaway URL and printing the raw bytes. Stage 5 points
- * that same, barely-changed machinery at the real pc_service on the LAN and
- * turns the reply into numbers: cJSON parses the body against the contract in
- * ARCHITECTURE.md, and the parsed values are printed over serial. Still no
- * display -- that is stage 6 (panel bring-up) and stage 7 (the two combined).
+ * This is the stage where the project does the thing it exists for. Every
+ * earlier stage built one half of it and proved that half alone: stage 3 joins
+ * WiFi, stage 4 proved the HTTP client, stage 5 fetches the real pc_service
+ * JSON and parses it into a usage_t, stage 6 got the round panel lit. Stage 7
+ * is the join -- usage_t rendered onto the glass, so the gadget is readable
+ * without a serial monitor attached.
  *
- * What stage 5 is actually testing is the *contract*, not the plumbing. The
- * plumbing was stage 4's job. The new questions here are: can the chip reach
- * the PC at all (a different problem from reaching the internet -- it depends
- * on the PC's firewall and its DHCP address, not on DNS or a route out), and
- * do the field names and types this file expects match the ones service.py
- * actually sends?
+ * What is deliberately still missing is stage 8: this draws exactly once, at
+ * boot. There is no refresh loop, no reconnect handling, and the failure
+ * screens are the minimum that stops the display from lying rather than the
+ * considered states the brief asks for.
  *
- * Success looks like: a 200, then a "parsed:" block listing both percentages,
- * both reset strings and the freshness line. pc_service must be RUNNING on
- * the PC named by PC_SERVICE_HOST in secrets.h -- stage 4 needed nothing on
- * the PC, so this is a new prerequisite and the most likely reason for a
- * "request failed: ESP_ERR_HTTP_CONNECT" on the first run.
+ * Success looks like: a colour cycle, "CONNECTING", then both percentages with
+ * their reset times. pc_service must be RUNNING on the PC named by
+ * PC_SERVICE_HOST in secrets.h -- otherwise the screen says NO LINK, which is
+ * itself the correct behaviour.
  *
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED, top to bottom:
@@ -28,9 +24,17 @@
  *   2. includes                 -- and what each one is actually for
  *   3. module state             -- the handful of file-scope variables
  *   4. WiFi event handlers      -- code the WiFi driver calls back into
- *   5. the usage fetch          -- stage 5: URL, accumulator, JSON, its task
- *   6. wifi_start()             -- one-time setup, in dependency order
- *   7. app_main()               -- the entry point; where execution begins
+ *   5. the JSON contract        -- stage 5: usage_t and its parser
+ *   6. the screen               -- stage 7: palette, layout, render functions
+ *   7. the usage fetch          -- the request, and what each outcome shows
+ *   8. wifi_start()             -- one-time setup, in dependency order
+ *   9. app_main()               -- the entry point; where execution begins
+ *
+ * One rule that is invisible in the code: gc9a01 is not thread-safe, and
+ * drawing happens from two places -- app_main (the boot messages) and the
+ * fetch task (everything after). They never overlap, because app_main draws
+ * only before creating that task and never again. If a later stage adds a
+ * second drawing task, that stops being true and needs a lock.
  *
  * The control flow is NOT top-to-bottom like a script. app_main() sets things
  * up and then *sleeps*; the interesting work happens in the event handlers,
@@ -495,6 +499,114 @@ static void print_usage(const usage_t *u)
     printf("---8<--- end ------8<---\n");
 }
 
+/* --- stage 7: putting it on the screen ------------------------------------ */
+
+/* The palette. Defined here rather than in gc9a01.h because these are choices
+ * about this product, not facts about the panel -- the driver supplies
+ * GC9A01_RGB and stays out of it. */
+#define COL_BG     GC9A01_BLACK
+#define COL_LABEL  GC9A01_RGB(115, 120, 135)   /* dim: labels are context   */
+#define COL_TIME   GC9A01_RGB(190, 195, 210)   /* reset times, readable     */
+#define COL_OK     GC9A01_RGB( 45, 200,  95)
+#define COL_WARN   GC9A01_RGB(240, 175,  45)
+#define COL_ALERT  GC9A01_RGB(235,  65,  60)
+
+/* The layout, as named constants rather than numbers buried in the drawing
+ * code, because the useful question about a round display is always "does this
+ * still fit inside the circle" and that is much easier to answer from a list.
+ *
+ * The panel is 240x240 but *round*: the controller addresses the full square
+ * and the corners are simply behind the bezel. The usable half-width at a
+ * given row y is sqrt(120^2 - (y-120)^2), so the top and bottom rows here are
+ * the tight ones -- at y=28 there are about 154 usable pixels, at y=205 about
+ * 135. Every line below is comfortably inside that. */
+#define ROW_5H_LABEL   28
+#define ROW_5H_VALUE   46
+#define ROW_5H_RESET   86
+#define ROW_DIVIDER   110
+#define ROW_7D_LABEL  122
+#define ROW_7D_VALUE  140
+#define ROW_7D_RESET  180
+#define ROW_STALE     205
+
+#define SCALE_LABEL  2       /* 12x14 px per character */
+#define SCALE_VALUE  5       /* 30x35 -- the number you read from across a desk */
+
+/* Green while there is room, amber when it is worth noticing, red when it is
+ * nearly gone. The thresholds are a judgement, not a standard: 50% of a
+ * five-hour window with hours left is fine, 80% is not. */
+static uint16_t usage_colour(int pct)
+{
+    if (pct < 50) { return COL_OK; }
+    if (pct < 80) { return COL_WARN; }
+    return COL_ALERT;
+}
+
+/* Horizontal centring is worth a helper because every line on this display is
+ * centred -- on a round panel there is no left margin to align to. */
+static void draw_centred(int y, const char *text, uint16_t fg, int scale)
+{
+    int w = gc9a01_text_width(text, scale);
+    gc9a01_draw_text((GC9A01_WIDTH - w) / 2, y, text, fg, COL_BG, scale);
+}
+
+/* Anything that is not a reading: "CONNECTING", "NO LINK", and so on. Keeping
+ * these on one code path means the screen can never sit showing a stale
+ * message that has quietly stopped being true -- whatever happened last is
+ * what is on the glass. Stage 8 makes these states richer; this is the
+ * minimum that stops the display from lying. */
+static void render_message(const char *line1, const char *line2)
+{
+    gc9a01_fill_screen(COL_BG);
+    draw_centred(100, line1, COL_TIME, 3);
+    if (line2 != NULL) {
+        draw_centred(140, line2, COL_LABEL, SCALE_LABEL);
+    }
+}
+
+/* The actual point of the whole project: usage_t, on the glass.
+ *
+ * This repaints the entire screen, which is fine for a single draw at boot and
+ * will not be at stage 8 -- repainting every field once a minute makes the
+ * whole display visibly flash even when only one digit changed. The primitive
+ * needed to fix that (fill_rect over just the changed region) already exists;
+ * what is missing is remembering what was drawn last, which is state that
+ * belongs with the refresh loop rather than here. */
+static void render_usage(const usage_t *u)
+{
+    char buf[8];
+
+    gc9a01_fill_screen(COL_BG);
+
+    draw_centred(ROW_5H_LABEL, "5-HOUR", COL_LABEL, SCALE_LABEL);
+    snprintf(buf, sizeof(buf), "%d%%", u->five_pct);
+    draw_centred(ROW_5H_VALUE, buf, usage_colour(u->five_pct), SCALE_VALUE);
+    /* "--" rather than an empty gap: the contract allows a null reset time,
+     * and a blank line would read as a rendering bug rather than as missing
+     * data. */
+    draw_centred(ROW_5H_RESET,
+                 u->five_resets_at[0] ? u->five_resets_at : "--",
+                 COL_TIME, SCALE_LABEL);
+
+    /* A hairline, not a box. It separates the two readings without competing
+     * with them for attention. */
+    gc9a01_fill_rect(60, ROW_DIVIDER, 120, 2, COL_LABEL);
+
+    draw_centred(ROW_7D_LABEL, "7-DAY", COL_LABEL, SCALE_LABEL);
+    snprintf(buf, sizeof(buf), "%d%%", u->seven_pct);
+    draw_centred(ROW_7D_VALUE, buf, usage_colour(u->seven_pct), SCALE_VALUE);
+    draw_centred(ROW_7D_RESET,
+                 u->seven_resets_at[0] ? u->seven_resets_at : "--",
+                 COL_TIME, SCALE_LABEL);
+
+    /* Shown only when it is true, so its presence means something. The numbers
+     * above are still real -- they are just not current -- which is why this
+     * is a badge rather than a replacement for them. */
+    if (u->stale) {
+        draw_centred(ROW_STALE, "STALE", COL_WARN, SCALE_LABEL);
+    }
+}
+
 /* --- the request itself --------------------------------------------------- */
 
 /* Performs the one request, prints what came back, and deletes itself.
@@ -578,6 +690,7 @@ static void usage_fetch_task(void *arg)
                       "pc_service not running; the PC firewall blocking this "
                       "port; or PC_SERVICE_HOST in secrets.h pointing at an "
                       "address DHCP has since handed to something else");
+        render_message("NO LINK", "PC SERVICE");
     } else {
         int     status = esp_http_client_get_status_code(client);
         int64_t clen   = esp_http_client_get_content_length(client);
@@ -601,14 +714,17 @@ static void usage_fetch_task(void *arg)
             ESP_LOGE(TAG, "response exceeded BODY_CAP (%d bytes) -- not parsing "
                           "a partial document; raise BODY_CAP if the contract "
                           "really did grow this much", BODY_CAP);
+            render_message("BAD DATA", "TOO LARGE");
 
         } else if (status == 200) {
             usage_t usage;
             if (parse_usage(body.buf, body.len, &usage)) {
                 print_usage(&usage);
-                ESP_LOGI(TAG, "stage 5 passed: the JSON contract works end to end");
+                render_usage(&usage);
+                ESP_LOGI(TAG, "stage 7: rendered to the display");
             } else {
                 /* The parse failed, so the raw bytes are the evidence. */
+                render_message("BAD DATA", "NOT JSON");
                 printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n",
                        body.buf);
             }
@@ -625,10 +741,12 @@ static void usage_fetch_task(void *arg)
             ESP_LOGW(TAG, "the network path works -- this is the PC's upstream "
                           "fetch failing, not the chip. Give it a poll interval "
                           "and retry, or read pc_service's own log");
+            render_message("NO DATA", "PC SERVICE");
 
         } else {
             ESP_LOGW(TAG, "unexpected status %d -- the contract only defines "
                           "200 and 503; body follows", status);
+            render_message("BAD DATA", "BAD STATUS");
             printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n",
                    body.buf);
         }
@@ -796,8 +914,14 @@ void app_main(void)
         gc9a01_fill_screen(probe[i].color);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    gc9a01_fill_screen(GC9A01_BLUE);
-    ESP_LOGI(TAG, "display ready (screen should now be solid BLUE and stay that way)");
+    /* Stage 6 rested on solid blue here, because at that stage a black screen
+     * and a dead panel looked identical and the resting state had to prove the
+     * panel was alive. Stage 7 has something truthful to say instead, and
+     * saying it is better: the WiFi join below can take twenty seconds, and a
+     * screen that sat blank or blue for that long would look broken. The
+     * colour cycle just above still does the panel-is-alive job. */
+    render_message("CONNECTING", NULL);
+    ESP_LOGI(TAG, "display ready");
 
     /* Must exist before wifi_start(), because the handlers it registers can
      * fire -- and touch this group -- the instant the radio starts. */

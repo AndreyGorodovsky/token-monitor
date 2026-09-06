@@ -12,15 +12,22 @@
  * HOW THIS FILE IS ORGANIZED:
  *
  *   1. pins and bus settings   -- the wiring, in code
- *   2. lcd_cmd / lcd_data      -- the only two ways anything reaches the panel
+ *   2. lcd_transmit            -- the one place any byte reaches the panel
  *   3. the vendor init table   -- copied, not derived; see the note above it
  *   4. gc9a01_init             -- reset, table, then standard MIPI commands
- *   5. gc9a01_fill_screen      -- address window + a row buffer, 240 times
+ *   5. fill_rect / fill_screen -- address window + a row buffer, h times
+ *   6. text                    -- glyph lookup, then one window per character
+ *
+ * Everything drawable is built from one idea: set an address window, then
+ * stream pixels into it. A rectangle and a character differ only in how the
+ * bytes are computed.
  * ---------------------------------------------------------------------------
  */
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <string.h>              /* strlen, for gc9a01_text_width */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"       /* vTaskDelay -- the reset and sleep-out
@@ -32,6 +39,7 @@
 #include "esp_log.h"
 
 #include "gc9a01.h"
+#include "font5x7.h"             /* generated -- see tools/make_font.py */
 
 static const char *TAG = "gc9a01";
 
@@ -287,12 +295,25 @@ void gc9a01_init(void)
      * family understands them, so unlike the table above these can be trusted
      * from the datasheet without cross-checking against other drivers. */
 
-    /* Memory access control: scan direction and RGB/BGR order. 0x08 is
-     * confirmed correct on this panel -- a red/green/blue cycle showed true
-     * colours, no swap. If red and blue ever come out exchanged, this is the
-     * byte to flip (try 0x00 or 0x48); that would be a calibration detail,
-     * never a wiring fault. */
-    uint8_t madctl = 0x08;
+    /* Memory access control: it sets both the scan direction and the RGB/BGR
+     * order, which is why one byte decides two apparently unrelated things.
+     * The bits that matter here:
+     *
+     *   0x80  MY   row address order      (flips vertically)
+     *   0x40  MX   column address order   (flips horizontally)
+     *   0x20  MV   row/column exchange    (rotates 90 degrees)
+     *   0x08  BGR  colour component order
+     *
+     * 0x48 = MX | BGR.
+     *
+     * This was 0x08 through stage 6, on the evidence of a red/green/blue fill
+     * test that showed true colours. That evidence was real but incomplete,
+     * and the distinction is worth keeping: a solid fill is symmetric, so it
+     * can prove the colour order and cannot say anything at all about
+     * orientation. The first asymmetric thing ever drawn on this panel -- text,
+     * at stage 7 -- came out mirrored left-to-right, which is MX. The BGR bit
+     * stays set, because that half of the original finding still holds. */
+    uint8_t madctl = 0x48;
     lcd_cmd(0x36);
     lcd_data(&madctl, 1);
 
@@ -340,25 +361,139 @@ static void lcd_set_addr_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t 
     lcd_cmd(0x2C);                /* memory write */
 }
 
-void gc9a01_fill_screen(uint16_t color565)
+void gc9a01_fill_rect(int x, int y, int w, int h, uint16_t color565)
 {
-    lcd_set_addr_window(0, 0, GC9A01_WIDTH - 1, GC9A01_HEIGHT - 1);
+    /* Clip first, so a caller may compute a rectangle that runs off the edge
+     * without having to check. Note the width is reduced *and* the origin
+     * moved when x or y is negative -- adjusting one without the other is the
+     * classic way to get a rectangle that is the wrong size and in the wrong
+     * place. */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > GC9A01_WIDTH)  { w = GC9A01_WIDTH  - x; }
+    if (y + h > GC9A01_HEIGHT) { h = GC9A01_HEIGHT - y; }
+    if (w <= 0 || h <= 0) {
+        return;                  /* entirely offscreen; nothing to do */
+    }
 
-    /* One row's worth of pixels, sent 240 times, rather than a full 115,200-byte
-     * framebuffer. That is not a micro-optimisation: a whole frame would be most
-     * of this chip's free heap, and the panel does not need it -- it tracks its
-     * own write position, so consecutive writes simply continue where the last
-     * one stopped.
+    lcd_set_addr_window(x, y, x + w - 1, y + h - 1);
+
+    /* One row's worth of pixels, sent h times, rather than a full 115,200-byte
+     * framebuffer. That is not a micro-optimisation: a whole frame would be
+     * most of this chip's free heap, and the panel does not need it -- it
+     * tracks its own write position, so consecutive writes simply continue
+     * where the last one stopped.
      *
-     * static, so it lives in .bss rather than on the caller's stack. RGB565 goes
-     * out most-significant byte first. */
+     * static, so it lives in .bss rather than on the caller's stack. Sized for
+     * the widest possible row. RGB565 goes out most-significant byte first. */
     static uint8_t row_buf[GC9A01_WIDTH * 2];
-    for (int i = 0; i < GC9A01_WIDTH; i++) {
+    for (int i = 0; i < w; i++) {
         row_buf[i * 2]     = color565 >> 8;
         row_buf[i * 2 + 1] = color565 & 0xFF;
     }
 
-    for (int y = 0; y < GC9A01_HEIGHT; y++) {
-        lcd_data(row_buf, sizeof(row_buf));
+    for (int r = 0; r < h; r++) {
+        lcd_data(row_buf, (size_t)w * 2);
     }
+}
+
+void gc9a01_fill_screen(uint16_t color565)
+{
+    gc9a01_fill_rect(0, 0, GC9A01_WIDTH, GC9A01_HEIGHT, color565);
+}
+
+/* --- text ---------------------------------------------------------------- */
+
+/* Which five column bytes to draw for a character. Everything the font cannot
+ * represent funnels through here to the box glyph, so no caller has to think
+ * about it. */
+static const uint8_t *glyph_for(char c)
+{
+    unsigned char u = (unsigned char)c;
+
+    /* The table is uppercase-only; folding here rather than storing a second
+     * 130 bytes of near-identical shapes. */
+    if (u >= 'a' && u <= 'z') {
+        u -= ('a' - 'A');
+    }
+    if (u < FONT5X7_FIRST || u > FONT5X7_LAST) {
+        return font5x7_unknown;
+    }
+    return font5x7[u - FONT5X7_FIRST];
+}
+
+/* One character cell, as a single address window: set the rectangle once, then
+ * stream every pixel of it. The alternative -- a fill_rect per lit pixel --
+ * would be hundreds of tiny SPI transactions per character. */
+static void draw_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale)
+{
+    const uint8_t *glyph = glyph_for(c);
+
+    const int cw = GC9A01_CHAR_W * scale;
+    const int ch = GC9A01_CHAR_H * scale;
+
+    /* Skip rather than clip. Half a character is not a smaller character, it
+     * is a corrupted one, and the address-window arithmetic for a partial
+     * glyph is exactly the sort of thing that goes subtly wrong. */
+    if (x < 0 || y < 0 || x + cw > GC9A01_WIDTH || y + ch > GC9A01_HEIGHT) {
+        return;
+    }
+
+    lcd_set_addr_window(x, y, x + cw - 1, y + ch - 1);
+
+    /* Big enough for the widest cell at the maximum scale; the clamp in
+     * gc9a01_draw_text is what keeps that promise true. */
+    static uint8_t row_buf[GC9A01_CHAR_W * GC9A01_MAX_TEXT_SCALE * 2];
+
+    for (int gy = 0; gy < FONT5X7_H; gy++) {
+        int n = 0;
+        for (int gx = 0; gx < GC9A01_CHAR_W; gx++) {
+            /* Column FONT5X7_W is the spacer: always background, never in the
+             * font data, which is why this reads the bit only for gx < 5. */
+            bool on = (gx < FONT5X7_W) && ((glyph[gx] >> gy) & 1);
+            uint16_t colour = on ? fg : bg;
+
+            for (int s = 0; s < scale; s++) {   /* horizontal magnification */
+                row_buf[n++] = colour >> 8;
+                row_buf[n++] = colour & 0xFF;
+            }
+        }
+        for (int s = 0; s < scale; s++) {       /* vertical magnification */
+            lcd_data(row_buf, (size_t)n);
+        }
+    }
+}
+
+void gc9a01_draw_text(int x, int y, const char *text,
+                      uint16_t fg565, uint16_t bg565, int scale)
+{
+    if (text == NULL) {
+        return;
+    }
+    /* Clamped, not asserted: scale sizes a fixed buffer in draw_char, so an
+     * out-of-range value would be a buffer overrun rather than an ugly glyph.
+     * Every caller in this project passes a literal, so this is a guard
+     * against future edits, not a runtime condition. */
+    if (scale < 1) { scale = 1; }
+    if (scale > GC9A01_MAX_TEXT_SCALE) { scale = GC9A01_MAX_TEXT_SCALE; }
+
+    for (const char *p = text; *p != '\0'; p++) {
+        draw_char(x, y, *p, fg565, bg565, scale);
+        x += GC9A01_CHAR_W * scale;
+    }
+}
+
+int gc9a01_text_width(const char *text, int scale)
+{
+    if (text == NULL || *text == '\0') {
+        return 0;
+    }
+    if (scale < 1) { scale = 1; }
+    if (scale > GC9A01_MAX_TEXT_SCALE) { scale = GC9A01_MAX_TEXT_SCALE; }
+
+    /* Every character advances a full cell, but the last one's trailing spacer
+     * is not ink. Counting it would push centred text half a spacer to the
+     * left, which is visible at scale 5. */
+    int len = (int)strlen(text);
+    return (len * GC9A01_CHAR_W - 1) * scale;
 }

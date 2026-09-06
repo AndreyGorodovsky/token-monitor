@@ -192,8 +192,9 @@ above.
   display-specific. `esp_lcd` plus a GC9A01 panel driver from the ESP
   Component Registry is one route; this project instead uses a hand-rolled
   driver on plain `spi_master` + `gpio`, which is confirmed working on this
-  panel (vendor init table, and `madctl = 0x08` for the correct color
-  order). Benefits of the hand-rolled route: no `managed_components/`, no
+  panel (vendor init table, and `madctl = 0x48` — the BGR bit for correct
+  colour order, plus MX, without which everything draws mirrored; see
+  `STATUS.md` for why that took until stage 7 to notice). Benefits of the hand-rolled route: no `managed_components/`, no
   internet needed for a first build, and no external dependency to track.
   Revisit `esp_lcd` only if a concrete need appears (e.g. DMA-backed
   double-buffering or LVGL).

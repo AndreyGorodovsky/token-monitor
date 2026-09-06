@@ -385,6 +385,40 @@ stage talks to it. It is needed again from stage 7 on (see Housekeeping).
   single instance.
 - **The PC must be on.** Known v1 limitation; a future server/cloud relay
   would replace only the credential-reading layer. See `ARCHITECTURE.md`.
+- **Expressive face on the display, instead of numbers alone.** Requested
+  during stage 6 planning: a smiley whose expression tracks usage (happy
+  when there is headroom, unhappier as the windows fill), rather than two
+  percentages and two reset strings on their own. Deliberately deferred so
+  stages 6-8 land as planned first — **revisit once the display works and
+  the real free-flash number is known**, which is the whole reason for
+  waiting.
+
+  The analysis, so it does not have to be redone:
+
+  | Approach | Cost per face | Notes |
+  |---|---|---|
+  | Procedural (circles + arcs) | ~0 bytes | Mouth curvature can be a continuous function of usage; animation free |
+  | 1-bit sprite, coloured on-chip | ~1.8 KB at 120px | Hand-designed art; a 10-frame blink ≈ 18 KB; needs a PNG→header script |
+  | Full-colour RGB565 sprite | ~28.8 KB at 120px | Four faces ≈ the entire remaining budget |
+
+  Constraint that drives the choice: **a single 240x240 RGB565 frame is
+  115,200 bytes**, and stage 5 leaves about 103 KB free in the app
+  partition — so one full-screen stored frame does not fit at all, and
+  literal GIF playback is out unless the partition table changes. A GIF
+  *decoder* would be the wrong tool regardless: the assets are fixed at
+  build time, so shipping an LZW decoder to unpack something that could
+  have been pre-converted is pure overhead.
+
+  Three design notes worth keeping with it. Buckets (happy under 25%,
+  neutral under 50%, ...) are the obvious reading of the request, but an
+  arc's curvature can vary *continuously* with the percentage for the same
+  code, which stays glanceable while also being precise — colour can carry
+  the coarse band on top. The face should probably track the **worse of the
+  two windows**, since a happy face while the 7-day sits at 90% would be
+  actively misleading. And a distinctive "asleep"/"?" face is a better
+  visible degrade for "service unreachable" than a text banner, which is
+  the definition-of-done requirement anyway — so this idea and stage 8's
+  fallback state want designing together.
 
 ## Housekeeping
 

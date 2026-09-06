@@ -546,8 +546,44 @@ static uint16_t usage_colour(int pct)
  * centred -- on a round panel there is no left margin to align to. */
 static void draw_centred(int y, const char *text, uint16_t fg, int scale)
 {
-    int w = gc9a01_text_width(text, scale);
-    gc9a01_draw_text((GC9A01_WIDTH - w) / 2, y, text, fg, COL_BG, scale);
+    const int cell = GC9A01_CHAR_W * scale;   /* full advance per character */
+
+    /* How many characters fit across the panel at this size. Two of the
+     * strings drawn here -- the reset times -- come from the PC, and the
+     * contract allows them to be longer than English "Thu 19:00" (a
+     * non-English weekday can be several bytes per letter). Left alone,
+     * an over-long string would silently lose its leading and trailing
+     * characters: draw_text skips any glyph that would fall off the panel,
+     * so the display would show a confidently centred fragment with nothing
+     * to say it had been cut. Truncating deliberately and marking it with
+     * ">" makes that visible, which is the rule this project keeps to. */
+    int max_chars = GC9A01_WIDTH / cell;
+
+    char clipped[32];
+    if (max_chars > (int)sizeof(clipped) - 2) {
+        max_chars = (int)sizeof(clipped) - 2;   /* room for '>' and the NUL */
+    }
+    if ((int)strlen(text) > max_chars) {
+        snprintf(clipped, sizeof(clipped), "%.*s>", max_chars - 1, text);
+        text = clipped;
+    }
+
+    const int len = (int)strlen(text);
+
+    /* gc9a01_text_width reports *ink*, excluding the last character's spacer
+     * column, which is what makes centring look right. But draw_text needs
+     * the whole six-column cell on screen for every glyph, so centring on ink
+     * alone can push that final cell one scale-step past the edge and lose
+     * the last character. Nudge left when that happens. */
+    int x = (GC9A01_WIDTH - gc9a01_text_width(text, scale)) / 2;
+    if (x + len * cell > GC9A01_WIDTH) {
+        x = GC9A01_WIDTH - len * cell;
+    }
+    if (x < 0) {
+        x = 0;
+    }
+
+    gc9a01_draw_text(x, y, text, fg, COL_BG, scale);
 }
 
 /* Anything that is not a reading: "CONNECTING", "NO LINK", and so on. Keeping
@@ -893,7 +929,9 @@ void app_main(void)
      * that might simply be *stuck* on one colour from a previous run; three
      * colours in sequence prove the chip is genuinely driving the panel, and
      * that red, green and blue come out as red, green and blue (which is what
-     * confirms madctl = 0x08 is right for this board).
+     * confirms the BGR bit of madctl -- and only that bit: a solid fill is
+     * symmetric, so it cannot say anything about orientation. That blind spot
+     * is why the mirroring went unnoticed until stage 7 drew text).
      *
      * It then rests on blue rather than black, deliberately. Black would be
      * the natural background for stage 7 -- but at this stage a black screen

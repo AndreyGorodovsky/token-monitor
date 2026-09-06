@@ -131,8 +131,9 @@ umbrella). The public surface is two functions, `gc9a01_init()` and
 `gc9a01_fill_screen()`; stage 7 adds the drawing primitives.
 
 - **Nothing that touches the panel changed.** The register table, the reset
-  timings, `madctl = 0x08` and the 10 MHz clock are byte-for-byte what was
-  proven on this board. That is the entire point: stage 6 changes only the
+  timings, `madctl` and the 10 MHz clock were byte-for-byte what had been
+  proven on this board. (`madctl` was `0x08` at this point; stage 7 corrected
+  it to `0x48` — see below. Everything else still stands.) That is the entire point: stage 6 changes only the
   *surroundings* — a real project with a WiFi radio running — so a dark
   screen would have one suspect, the environment.
 - **The clock stays at 10 MHz for now.** Many GC9A01 boards run at 40 MHz and
@@ -256,6 +257,44 @@ adjacent, and it is worth asking what a passing test is *blind* to rather
 than only what it covers. And the staged build worked exactly as intended
 here: the bug was found the moment the first stage capable of exposing it
 ran, with one suspect and a one-byte fix.
+
+### Review pass on stage 7
+
+A review found no correctness bugs in the new drawing logic -- clipping,
+buffer sizing, the address-window maths and the centring were all checked and
+were right, and regenerating `font5x7.h` from the script produced a
+byte-identical file. What it did find was one latent API trap and a cluster of
+documentation that this very commit had made false. All fixed:
+
+- **Text that did not fit vanished silently.** `draw_char` skips any glyph
+  whose full cell would fall off the panel, so an over-long string lost its
+  leading *and* trailing characters and displayed a confidently centred
+  fragment. Reachable from network data: reset times are `char[24]`, and the
+  contract explicitly anticipates a longer non-English weekday. `draw_centred`
+  now truncates deliberately and marks it with `>`. **Verified by modelling
+  the arithmetic in Python** rather than by another flash cycle: for every
+  length 0-40 at every scale in use, no glyph cell can now fall off the panel,
+  and normal strings are positioned exactly as before.
+- **`gc9a01_text_width` reports ink; `draw_char` needs the whole cell.** So
+  right-aligning at `x = 240 - text_width(...)` silently loses the last glyph
+  -- the helper says it fits and the renderer disagrees. Documented at the
+  function, since it is a trap rather than a bug.
+- **`GC9A01_CHAR_H` must equal `FONT5X7_H`** and nothing said so, which is
+  easy to miss because the *width* pair is deliberately unequal (6 vs 5, for
+  the spacer). Raising the cell height for line spacing would leave every
+  glyph's window under-filled, and the next draw would land inside the
+  previous character's window. Now a `_Static_assert`.
+- **Four stale documentation claims**, all created by the stage 7 commit
+  itself: the driver header still said only `app_main` draws (the fetch task
+  draws too, and the safety rests on an unenforced ordering convention);
+  `app_main`'s comment still credited the colour cycle with confirming
+  `madctl = 0x08`; and `firmware/README.md` kept two copies of the old
+  "resting blue" behaviour plus an expected log line that never existed.
+
+The pattern worth noting: the bugs were in the *documentation the change
+invalidated*, not in the change. Editing one copy of a claim and missing the
+other two is the recurring failure mode in this repo, and it is what a review
+catches cheaply.
 
 ## Facts established so far (don't re-derive)
 

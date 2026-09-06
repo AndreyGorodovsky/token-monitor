@@ -41,6 +41,21 @@
 #include "gc9a01.h"
 #include "font5x7.h"             /* generated -- see tools/make_font.py */
 
+/* draw_char sizes its address window from GC9A01_CHAR_H but streams
+ * FONT5X7_H rows into it. They are equal today, and nothing except this line
+ * says they have to be -- which is easy to miss precisely because the width
+ * pair is deliberately *un*equal (GC9A01_CHAR_W is 6, one wider than the
+ * font, for the spacer column between characters).
+ *
+ * The failure it guards against is nasty rather than obvious. Raising
+ * GC9A01_CHAR_H to add line spacing would leave every glyph's window
+ * under-filled, and because the controller tracks its own write position, the
+ * *next* draw call's pixels would land inside the previous character's
+ * unfinished window instead of where they were addressed. */
+_Static_assert(GC9A01_CHAR_H == FONT5X7_H,
+               "GC9A01_CHAR_H must equal FONT5X7_H; see the note above. To add "
+               "line spacing, space the rows in the layout, not the cell.");
+
 static const char *TAG = "gc9a01";
 
 /* The wiring, as confirmed against the board's own silkscreen. The full table

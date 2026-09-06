@@ -1,11 +1,12 @@
 /* GC9A01 round TFT driver -- 1.28", 240x240, RGB565, SPI.
  *
- * Stage 6's whole job is this file and its .c: get the panel lit inside the
- * real firmware, with nothing else in the way. The interface is deliberately
- * two functions wide for now. Stage 7 adds the drawing primitives (rectangle
- * fill, text, arcs) that render actual usage data; keeping stage 6 to "init
- * and fill" means that if the screen stays dark, no drawing code exists yet
- * to be a suspect.
+ * Init and one solid fill was the whole of it at stage 6, deliberately: if
+ * the screen had stayed dark, no drawing code existed yet to be a suspect.
+ * Stage 7 added the rest -- rectangles and text -- on the same foundation.
+ *
+ * Everything here is built from one idea: set an address window on the panel,
+ * then stream pixels into it. A rectangle and a character differ only in how
+ * the bytes are computed.
  *
  * Written against plain `spi_master` + `gpio` rather than `esp_lcd` plus a
  * Component Registry driver: the point of the esp_lcd route would have been
@@ -14,11 +15,17 @@
  * came near this project. See ../../ARCHITECTURE.md for that reasoning and
  * for the pinout.
  *
- * Not thread-safe, and not made so: every call must come from one task. The
- * SPI device handle and the row buffer inside the .c are shared mutable
- * state, and two tasks drawing at once would interleave pixel data mid-frame.
- * Today only app_main draws; when stage 8 adds a refresh loop, drawing stays
- * on a single task.
+ * NOT THREAD-SAFE, and not made so. The SPI device handle, the row buffer and
+ * the address window are all shared mutable state; two tasks drawing at once
+ * would interleave pixel data mid-frame, and because the panel tracks its own
+ * write position the damage would not be confined to one of them.
+ *
+ * As of stage 7 two tasks *do* call in here -- app_main draws the boot
+ * messages, and the fetch task draws everything after. That is safe only
+ * because they never overlap: app_main stops drawing before it creates the
+ * fetch task, and never draws again. This is an ordering guarantee held by
+ * convention, with nothing enforcing it. Any third caller, or a refresh loop
+ * that draws while app_main still might, needs a mutex first.
  */
 #pragma once
 
@@ -110,5 +117,12 @@ void gc9a01_draw_text(int x, int y, const char *text,
 
 /* Width in pixels of `text` at `scale`, excluding the trailing spacer column,
  * so that centring on it looks centred. Height is always
- * GC9A01_CHAR_H * scale. */
+ * GC9A01_CHAR_H * scale.
+ *
+ * Careful with right-alignment: this reports *ink*, but gc9a01_draw_text
+ * needs the full six-column cell of every glyph to be on-screen. Placing text
+ * at `x = 240 - gc9a01_text_width(...)` therefore pushes the last cell one
+ * scale-step past the edge, and that glyph is dropped -- this function says it
+ * fits, and the renderer disagrees. For alignment against a right-hand edge,
+ * measure the advance instead: strlen * GC9A01_CHAR_W * scale. */
 int gc9a01_text_width(const char *text, int scale);

@@ -76,7 +76,7 @@ idf.py -p COM3 flash monitor      REM adjust the port
 Expect roughly this, in this order:
 
 ```
-I (…) token_monitor: stage 7: usage on the display
+I (…) token_monitor: stage 6: display bring-up
 I (…) gc9a01: hardware reset...
 I (…) gc9a01: sending 42 vendor init commands...
 I (…) gc9a01: init done
@@ -211,8 +211,7 @@ The interface is two functions wide on purpose (`gc9a01_init`,
 `gc9a01_fill_screen`); stage 7 adds rectangle fills and text on top of the
 same address-window mechanism.
 
-**What stage 6 puts on the screen**, in the first two and a half seconds
-after reset:
+**The panel self-test**, in the first two and a half seconds after reset:
 
 ```
 I (422) gc9a01: hardware reset...
@@ -221,16 +220,25 @@ I (722) gc9a01: init done
 I (722) token_monitor:   fill: RED
 I (1312) token_monitor:   fill: GREEN
 I (1902) token_monitor:   fill: BLUE
-I (2582) token_monitor: display ready (screen should now be solid BLUE and stay that way)
+I (2582) token_monitor: display ready
 ```
 
-Three colours rather than one, and it rests **lit** rather than black. Both
-are deliberate. A single fill could be a screen stuck on a colour from a
-previous run, whereas a sequence proves the chip is genuinely driving the
-panel — and that red, green and blue arrive as red, green and blue, which is
-what confirms the BGR half of `madctl`. Resting on blue matters because a black screen
-and a *dead* screen look identical, so the resting state would otherwise
-prove nothing to anyone who missed the cycle.
+Three colours rather than one, deliberately: a single fill could be a screen
+stuck on a colour from a previous run, whereas a sequence proves the chip is
+genuinely driving the panel — and that red, green and blue arrive as red,
+green and blue.
+
+That confirms the BGR bit of `madctl` and **nothing else**. A solid fill is
+symmetric, so it is blind to orientation — which is why this panel drew
+everything mirrored for six stages with no test able to notice, until stage 7
+rendered text. Worth remembering as a general habit: ask what a passing test
+is blind to, not only what it covers.
+
+Through stage 6 the cycle ended on solid blue, because a black screen and a
+*dead* screen look identical and the resting state had to carry the proof.
+Stage 7 ends on `CONNECTING` instead — still black, but with text on it, which
+makes the same point while saying something true about what the device is
+doing during the WiFi join.
 
 The display is initialized **before** WiFi starts: the panel does not need the
 network, the screen lights within a third of a second instead of after a

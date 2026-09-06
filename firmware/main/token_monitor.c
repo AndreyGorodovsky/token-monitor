@@ -1,21 +1,25 @@
-/* Token monitor -- firmware stage 4: WiFi, plus one HTTP sanity check.
+/* Token monitor -- firmware stage 5: fetch the real usage JSON and parse it.
  *
  * Stage 3 (still here, unchanged) joins the WiFi network and prints the IP
- * address the router hands us. Stage 4 adds exactly one thing on top: a
- * single GET to a trivial, known-good web address, printing the raw response
- * body over serial. No JSON, no display, and deliberately not pc_service yet.
+ * address the router hands us. Stage 4 proved esp_http_client works on this
+ * chip by GETting a throwaway URL and printing the raw bytes. Stage 5 points
+ * that same, barely-changed machinery at the real pc_service on the LAN and
+ * turns the reply into numbers: cJSON parses the body against the contract in
+ * ARCHITECTURE.md, and the parsed values are printed over serial. Still no
+ * display -- that is stage 6 (panel bring-up) and stage 7 (the two combined).
  *
- * Why bother with a throwaway URL instead of going straight to the real
- * service: if the first-ever esp_http_client call were also the first-ever
- * call to pc_service, a failure would have two suspects -- the HTTP client on
- * this chip and IDF version, or the service on the PC (not running? firewall?
- * wrong port?). Proving the client against something that is definitely up
- * turns the next stage's debugging into a single-suspect problem. It also
- * proves DNS resolution works, which pc_service (reached by raw IP) never
- * would.
+ * What stage 5 is actually testing is the *contract*, not the plumbing. The
+ * plumbing was stage 4's job. The new questions here are: can the chip reach
+ * the PC at all (a different problem from reaching the internet -- it depends
+ * on the PC's firewall and its DHCP address, not on DNS or a route out), and
+ * do the field names and types this file expects match the ones service.py
+ * actually sends?
  *
- * Success looks like: a 200, a content length, and readable HTML between the
- * two "---8<---" markers in the serial monitor.
+ * Success looks like: a 200, then a "parsed:" block listing both percentages,
+ * both reset strings and the freshness line. pc_service must be RUNNING on
+ * the PC named by PC_SERVICE_HOST in secrets.h -- stage 4 needed nothing on
+ * the PC, so this is a new prerequisite and the most likely reason for a
+ * "request failed: ESP_ERR_HTTP_CONNECT" on the first run.
  *
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED, top to bottom:
@@ -24,7 +28,7 @@
  *   2. includes                 -- and what each one is actually for
  *   3. module state             -- the handful of file-scope variables
  *   4. WiFi event handlers      -- code the WiFi driver calls back into
- *   5. the HTTP sanity check    -- stage 4: its accumulator, handler, task
+ *   5. the usage fetch          -- stage 5: URL, accumulator, JSON, its task
  *   6. wifi_start()             -- one-time setup, in dependency order
  *   7. app_main()               -- the entry point; where execution begins
  *
@@ -47,7 +51,10 @@
 #  endif
 #endif
 
-#include <string.h>                  /* memcpy, for copying credentials     */
+#include <stdio.h>                   /* printf, and snprintf for the safe
+                                      * bounded string copies in the parser  */
+#include <string.h>                  /* memcpy, for copying credentials;
+                                      * memset, for zeroing the parsed struct */
 #include <inttypes.h>                /* PRId64 -- see the note where it is
                                       * used; printing a 64-bit value with a
                                       * hardcoded "%lld" is not portable      */
@@ -65,6 +72,10 @@
 #include "esp_netif.h"               /* TCP/IP stack + network interfaces   */
 #include "esp_timer.h"               /* one-shot timers, off the event loop */
 #include "esp_http_client.h"         /* stage 4: the HTTP client itself     */
+#include "cJSON.h"                   /* stage 5: the JSON parser (IDF's own
+                                      * `json` component -- added to REQUIRES
+                                      * in CMakeLists.txt, same as the HTTP
+                                      * client was; no download needed)     */
 #include "esp_log.h"                 /* ESP_LOGI / ESP_LOGW / ESP_LOGE      */
 
 #include "secrets.h"                 /* YOUR values -- gitignored           */
@@ -196,28 +207,41 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
     xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
 }
 
-/* --- stage 4: the HTTP sanity check -------------------------------------- */
+/* --- stage 5: fetching and parsing the usage JSON ------------------------ */
 
-/* A plain-HTTP address, on purpose. https:// would pull in TLS, a certificate
- * bundle, and roughly 40 KB of extra RAM at handshake time -- none of which
- * stage 5 needs, because pc_service serves plain HTTP on the LAN. Testing
- * with TLS here would prove something we are not going to use, and hide the
- * thing we are.
+/* The URL is assembled from secrets.h rather than written out here, because
+ * the host part is a real LAN address -- machine-specific, and this file is
+ * committed to a public repo. secrets.h is gitignored; see SECRETS.md.
  *
- * example.com is maintained by IANA for exactly this purpose: it is stable,
- * small, and answers plain HTTP with a 200 rather than redirecting to HTTPS.
- * If a network hijacks it (some captive portals and ISPs do), http://neverssl.com
- * is the usual fallback -- it exists specifically to never redirect. */
-#define SANITY_URL "http://example.com/"
+ * The two-step STRINGIFY is a standard C preprocessor idiom, and it is worth
+ * understanding rather than copying. The `#` operator turns a macro argument
+ * into a string literal, but it does so *before* that argument is itself
+ * expanded. So a one-step version of this would produce the literal text
+ * "PC_SERVICE_PORT" instead of "8734". Passing it through an outer macro
+ * first forces the expansion to happen, and only the inner macro stringifies.
+ *
+ * Adjacent string literals are concatenated by the compiler, so the result is
+ * a single compile-time constant -- no sprintf, no buffer, nothing to get
+ * wrong at runtime. Note pc_service serves plain HTTP: no TLS on the LAN, by
+ * design (ARCHITECTURE.md's "trust boundary is the home network"), which is
+ * also why stage 4 deliberately tested without it. */
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x)  STRINGIFY_(x)
+#define USAGE_URL "http://" PC_SERVICE_HOST ":" STRINGIFY(PC_SERVICE_PORT) "/usage"
 
 /* Where the response body accumulates.
  *
  * The body does NOT arrive in one piece: esp_http_client hands it to us in
  * chunks as TCP segments land, calling our event handler once per chunk. That
- * is the single most important thing this stage demonstrates, because it is
- * exactly the shape stage 5 has to feed to cJSON -- which needs the whole
- * document at once, not a fragment. So the handler's job is to append, and
- * only the code after the request completes gets to look at the result. */
+ * is what stage 4 existed to demonstrate, and this stage is where it pays
+ * off: cJSON needs the whole document at once, and would fail on a fragment.
+ * So the handler's job is to append, and only the code after the request
+ * completes gets to look at the result.
+ *
+ * `len` is also the authoritative answer to "how much body arrived". Do not
+ * substitute the Content-Length header: stage 4 hit a chunked response where
+ * esp_http_client_get_content_length() returns -1, and a parser gated on that
+ * number would have refused a perfectly good document. */
 typedef struct {
     char *buf;          /* caller-owned storage                             */
     int   cap;          /* its size in bytes, including room for the NUL    */
@@ -225,12 +249,12 @@ typedef struct {
     bool  truncated;    /* true if the response was bigger than cap         */
 } body_buf_t;
 
-/* 4 KB holds example.com's ~1.2 KB of HTML with room to spare, and is far
- * more than the few hundred bytes of JSON stage 5 will see. The cap exists
- * so a surprisingly large response cannot walk off the end of the buffer:
- * an undocumented endpoint changing its mind about response size is a real
- * possibility, and "truncate and say so" beats both "corrupt memory" and
- * "silently return half a document". */
+/* 4 KB is generous: the real payload is around 250 bytes of JSON. The cap
+ * exists so a surprisingly large response cannot walk off the end of the
+ * buffer -- "truncate and say so" beats both "corrupt memory" and "silently
+ * return half a document". Truncation is treated as a hard failure below
+ * rather than something to parse anyway: half a JSON document is not a
+ * smaller document, it is a broken one. */
 #define BODY_CAP 4096
 
 /* Called by esp_http_client at each stage of the request. Runs on whichever
@@ -279,7 +303,200 @@ static esp_err_t on_http_event(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* Performs the one request, prints the result, and deletes itself.
+
+/* --- reading the contract out of the JSON --------------------------------- */
+
+/* The parsed form of ARCHITECTURE.md's contract: everything the display will
+ * eventually need, and nothing else. Filling this in is the whole point of
+ * stage 5; stage 7 renders it.
+ *
+ * Absent or null fields are represented rather than being an error, because
+ * the contract genuinely allows them: a reset time can arrive as JSON null if
+ * pc_service could not parse the upstream timestamp, and the "updated"/"now"
+ * pair is absent whenever there has been no successful poll. Only the two
+ * percentages are mandatory -- without them there is nothing to show. */
+#define TIME_STR_CAP 24    /* "Fri 17:00" is 9 bytes, but %a is locale-
+                            * dependent on the PC: a non-English Windows can
+                            * send a longer, multi-byte weekday. Truncating
+                            * safely is snprintf's job below; this cap just
+                            * has to be comfortably larger than "HH:MM".   */
+
+typedef struct {
+    int     five_pct;                        /* 0-100, already rounded by PC */
+    int     seven_pct;
+    char    five_resets_at[TIME_STR_CAP];    /* "" when the field was null   */
+    char    seven_resets_at[TIME_STR_CAP];
+    int64_t five_resets_epoch;               /* 0 when absent                */
+    int64_t seven_resets_epoch;
+    char    updated_at[TIME_STR_CAP];
+    int64_t updated_epoch;
+    int64_t now_epoch;                       /* the PC's clock, for age math */
+    bool    stale;                           /* true = last-known, not fresh */
+} usage_t;
+
+/* Three small accessors, so the parse below reads as a list of fields rather
+ * than a wall of NULL checks. Each one answers "is this field present AND the
+ * type I expect?" -- and a JSON null answers no, which is exactly right: the
+ * cJSON type check does the null-handling for free. */
+
+static bool json_get_int(const cJSON *obj, const char *key, int *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsNumber(item)) {
+        return false;
+    }
+    /* +0.5 so a float that slipped through rounds rather than truncating. The
+     * upstream endpoint sends utilization as 24.0 and pc_service rounds it,
+     * but this is a contract with another program -- not an assumption to bet
+     * on. Percentages are never negative, so adding a half is safe here. */
+    *out = (int)(cJSON_GetNumberValue(item) + 0.5);
+    return true;
+}
+
+static bool json_get_epoch(const cJSON *obj, const char *key, int64_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsNumber(item)) {
+        return false;
+    }
+    /* Deliberately the double, not item->valueint. cJSON stores every number
+     * twice: as a double, and as an `int` it clamps to INT_MAX. A Unix epoch
+     * (1.79e9) still fits in a 32-bit int today, but stops fitting in 2038 --
+     * at which point valueint would silently pin to 2147483647. A double
+     * represents every integer up to 2^53 exactly, so it has no such cliff. */
+    *out = (int64_t)cJSON_GetNumberValue(item);
+    return true;
+}
+
+static void json_get_str(const cJSON *obj, const char *key, char *out, size_t cap)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    const char *value = cJSON_GetStringValue(item);   /* NULL unless a string */
+
+    /* snprintf, not strcpy: it always NUL-terminates and never writes past
+     * cap, so a longer-than-expected weekday name truncates instead of
+     * corrupting the struct. An absent field becomes "", which print_usage
+     * renders as "--". */
+    snprintf(out, cap, "%s", value ? value : "");
+}
+
+/* Turns the accumulated body into a usage_t. Returns false if the response
+ * was not JSON at all, or was JSON that does not carry the two percentages.
+ *
+ * Note `len` rather than a NUL-terminated string: cJSON_ParseWithLength can
+ * never read past the end of the buffer even if the terminator went missing,
+ * and we have an exact byte count from the accumulator anyway. */
+static bool parse_usage(const char *json, int len, usage_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    cJSON *root = cJSON_ParseWithLength(json, (size_t)len);
+    if (root == NULL) {
+        /* cJSON_GetErrorPtr points into the buffer we just handed in, so the
+         * subtraction gives the byte offset where parsing gave up -- much more
+         * useful than "parse failed" when the reply turns out to be an HTML
+         * error page from something that is not pc_service. (It is global
+         * state inside cJSON, valid only until the next parse on any task;
+         * fine here, where one task does all the parsing.) */
+        const char *stop = cJSON_GetErrorPtr();
+        ESP_LOGE(TAG, "body is not valid JSON (parser gave up at byte %d of %d)",
+                 stop ? (int)(stop - json) : -1, len);
+        return false;
+    }
+
+    bool ok = json_get_int(root, "five_hour_pct", &out->five_pct)
+           && json_get_int(root, "seven_day_pct", &out->seven_pct);
+
+    if (!ok) {
+        ESP_LOGE(TAG, "valid JSON, but five_hour_pct/seven_day_pct are missing "
+                      "or not numbers -- pc_service and this firmware disagree "
+                      "about the contract in ARCHITECTURE.md");
+    } else {
+        json_get_str(root, "five_hour_resets_at", out->five_resets_at,
+                     sizeof(out->five_resets_at));
+        json_get_str(root, "seven_day_resets_at", out->seven_resets_at,
+                     sizeof(out->seven_resets_at));
+        json_get_str(root, "updated_at", out->updated_at,
+                     sizeof(out->updated_at));
+
+        json_get_epoch(root, "five_hour_resets_epoch", &out->five_resets_epoch);
+        json_get_epoch(root, "seven_day_resets_epoch", &out->seven_resets_epoch);
+        json_get_epoch(root, "updated_epoch",          &out->updated_epoch);
+        json_get_epoch(root, "now_epoch",              &out->now_epoch);
+
+        /* cJSON_IsTrue is false for absent, null, and non-boolean alike, which
+         * is the safe default here: unknown freshness reads as fresh and is
+         * caught by the age check instead, rather than flashing a stale badge
+         * because of a typo'd field name. */
+        out->stale = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "stale"));
+    }
+
+    /* One Delete for the whole tree. cJSON allocates every node on the heap
+     * and frees children with their parent, so this single call is the
+     * complete cleanup -- but skipping it leaks the lot, which a once-a-minute
+     * refresh loop would notice within a day. */
+    cJSON_Delete(root);
+    return ok;
+}
+
+/* Pulls just the "error" string out of a 503 body. A separate, tiny function
+ * because a 503 is a different document (ARCHITECTURE.md: `{stale, error}`)
+ * and running it through parse_usage would only report the percentages as
+ * missing, which is true but unhelpful. */
+static void parse_error_reason(const char *json, int len, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", "no reason given");
+
+    cJSON *root = cJSON_ParseWithLength(json, (size_t)len);
+    if (root == NULL) {
+        return;
+    }
+    const char *reason = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(root, "error"));
+    if (reason != NULL) {
+        snprintf(out, cap, "%s", reason);
+    }
+    cJSON_Delete(root);
+}
+
+/* printf rather than ESP_LOGI, for the same reason stage 4 printed the body
+ * that way: the log macros prefix and colour every line, which makes a small
+ * aligned block hard to read. This is the human-facing proof that stage 5
+ * worked, so it is worth laying out. */
+static void print_usage(const usage_t *u)
+{
+    /* An empty string means the field was null or absent; "--" says that
+     * plainly instead of printing nothing and looking like a formatting bug. */
+    const char *five_at  = u->five_resets_at[0]  ? u->five_resets_at  : "--";
+    const char *seven_at = u->seven_resets_at[0] ? u->seven_resets_at : "--";
+    const char *updated  = u->updated_at[0]      ? u->updated_at      : "--";
+
+    printf("---8<--- parsed ---8<---\n");
+    printf("  5-hour : %3d%%   resets %-10s (epoch %" PRId64 ")\n",
+           u->five_pct, five_at, u->five_resets_epoch);
+    printf("  7-day  : %3d%%   resets %-10s (epoch %" PRId64 ")\n",
+           u->seven_pct, seven_at, u->seven_resets_epoch);
+    printf("  updated %s   stale: %s\n", updated, u->stale ? "YES" : "no");
+
+    /* The chip has no reliable clock of its own (no RTC battery, no SNTP), and
+     * that is exactly why the contract ships now_epoch alongside updated_epoch:
+     * both come from the PC, so subtracting them gives a true age without the
+     * chip needing to know what time it is. This is the number stage 8 will
+     * use to decide when data is too old to show at all. */
+    if (u->updated_epoch > 0 && u->now_epoch > 0) {
+        printf("  data age: %" PRId64 "s by the PC's clock\n",
+               u->now_epoch - u->updated_epoch);
+    }
+    printf("---8<--- end ------8<---\n");
+}
+
+/* --- the request itself --------------------------------------------------- */
+
+/* Performs the one request, prints what came back, and deletes itself.
+ *
+ * Still one shot, not a loop: the periodic refresh is stage 8's job, and
+ * keeping this single-shot means a failure here is one request to reason
+ * about rather than a scrolling log. Power-cycle to run it again.
  *
  * Why this is a task rather than a few lines inside app_main: app_main runs
  * on a task whose stack is CONFIG_ESP_MAIN_TASK_STACK_SIZE, which is 3584
@@ -287,11 +504,12 @@ static esp_err_t on_http_event(esp_http_client_event_t *evt)
  * the HTTP parser are on the stack, and overflowing it produces a stack
  * canary panic and a reboot rather than a tidy error. 8 KB is what ESP-IDF's
  * own esp_http_client example allocates, and it is the number to start from
- * rather than tuning downward without a measurement.
+ * rather than tuning downward without a measurement. cJSON adds little to
+ * that: its tree goes on the heap, not on this stack.
  *
  * A task that has finished its work must delete itself; falling off the end
  * of a task function without calling vTaskDelete(NULL) crashes the system. */
-static void http_sanity_task(void *arg)
+static void usage_fetch_task(void *arg)
 {
     /* static, so this 4 KB sits in .bss rather than on the task's stack --
      * which we just went to some trouble to leave room in. */
@@ -304,7 +522,7 @@ static void http_sanity_task(void *arg)
      * this struct. .user_data is the pointer handed back to our event handler
      * -- it is how the handler knows where to append without a global. */
     esp_http_client_config_t cfg = {
-        .url           = SANITY_URL,
+        .url           = USAGE_URL,
         .method        = HTTP_METHOD_GET,
         .event_handler = on_http_event,
         .user_data     = &body,
@@ -313,7 +531,7 @@ static void http_sanity_task(void *arg)
                                    * fails visibly instead of hanging      */
     };
 
-    ESP_LOGI(TAG, "stage 4: GET %s", SANITY_URL);
+    ESP_LOGI(TAG, "stage 5: GET %s", USAGE_URL);
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
@@ -322,51 +540,87 @@ static void http_sanity_task(void *arg)
         return;                  /* unreachable; states the intent clearly */
     }
 
-    /* perform() blocks until the whole exchange finishes: DNS, connect,
-     * request, response, and every on_http_event call above. Note this is
-     * NOT wrapped in ESP_ERROR_CHECK -- a failed network request is a normal
-     * condition to report, not a reason to abort the program. That rule is
-     * the whole reason stage 8 can have a "service unreachable" screen. */
+    /* perform() blocks until the whole exchange finishes: connect, request,
+     * response, and every on_http_event call above. Note this is NOT wrapped
+     * in ESP_ERROR_CHECK -- a failed network request is a normal condition to
+     * report, not a reason to abort the program. That rule is the whole reason
+     * stage 8 can have a "service unreachable" screen. */
     esp_err_t err = esp_http_client_perform(client);
 
-    if (err == ESP_OK) {
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "request failed: %s", esp_err_to_name(err));
+        /* Stage 4 already proved this chip can resolve DNS and reach the
+         * internet, so a failure here is almost certainly on the PC side or in
+         * secrets.h -- worth saying, because the instinct is to blame WiFi. */
+        ESP_LOGE(TAG, "stage 4 reached the internet from this chip, so suspect: "
+                      "pc_service not running; the PC firewall blocking this "
+                      "port; or PC_SERVICE_HOST in secrets.h pointing at an "
+                      "address DHCP has since handed to something else");
+    } else {
         int     status = esp_http_client_get_status_code(client);
         int64_t clen   = esp_http_client_get_content_length(client);
 
         /* PRId64 expands to the right length modifier for a 64-bit integer on
          * this platform. Hardcoding "%lld" happens to work here but warns or
-         * breaks elsewhere; IDF builds with -Wall, so this is the habit. */
-        ESP_LOGI(TAG, "status %d, content-length %" PRId64 ", body %d bytes%s",
-                 status, clen, body.len,
+         * breaks elsewhere; IDF builds with -Wall, so this is the habit.
+         *
+         * A content-length of -1 is not an error: it means the reply arrived
+         * chunked, with no Content-Length header, which is what stage 4 saw
+         * from example.com. The accumulator's own byte count is the number
+         * that matters, and it is the one the parser is given. */
+        ESP_LOGI(TAG, "status %d, content-length %" PRId64 "%s, body %d bytes%s",
+                 status, clen, (clen < 0) ? " (chunked)" : "", body.len,
                  body.truncated ? " (TRUNCATED at BODY_CAP)" : "");
 
-        /* printf rather than ESP_LOGI for the body itself: the log macros
-         * prefix every call with "I (12345) token_monitor:" and colour codes,
-         * which makes multi-line HTML almost unreadable. The markers make it
-         * obvious where the body starts and stops. */
-        printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n", body.buf);
+        if (body.truncated) {
+            /* Parsing a truncated document would fail anyway, but with a
+             * misleading "invalid JSON" message pointing at the last byte.
+             * Say what actually happened instead. */
+            ESP_LOGE(TAG, "response exceeded BODY_CAP (%d bytes) -- not parsing "
+                          "a partial document; raise BODY_CAP if the contract "
+                          "really did grow this much", BODY_CAP);
 
-        if (status != 200) {
-            ESP_LOGW(TAG, "expected 200 -- a %d still proves the client works, "
-                          "but check the URL", status);
+        } else if (status == 200) {
+            usage_t usage;
+            if (parse_usage(body.buf, body.len, &usage)) {
+                print_usage(&usage);
+                ESP_LOGI(TAG, "stage 5 passed: the JSON contract works end to end");
+            } else {
+                /* The parse failed, so the raw bytes are the evidence. */
+                printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n",
+                       body.buf);
+            }
+
+        } else if (status == 503) {
+            /* A documented, expected response -- not a failure of this
+             * firmware. It means pc_service is up but has never completed a
+             * poll (it was just started, or Anthropic is rate-limiting it), so
+             * there is no last-known data to serve even as stale. From stage 7
+             * on this is a "no data" screen, not an error screen. */
+            char reason[96];
+            parse_error_reason(body.buf, body.len, reason, sizeof(reason));
+            ESP_LOGW(TAG, "pc_service has no data yet (503): %s", reason);
+            ESP_LOGW(TAG, "the network path works -- this is the PC's upstream "
+                          "fetch failing, not the chip. Give it a poll interval "
+                          "and retry, or read pc_service's own log");
+
+        } else {
+            ESP_LOGW(TAG, "unexpected status %d -- the contract only defines "
+                          "200 and 503; body follows", status);
+            printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n",
+                   body.buf);
         }
-    } else {
-        /* esp_err_to_name turns the numeric code into something searchable,
-         * e.g. ESP_ERR_HTTP_CONNECT for a refused connection or
-         * ESP_ERR_HTTP_EAGAIN for a timeout. */
-        ESP_LOGE(TAG, "request failed: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "the chip has an IP, so suspect DNS, a captive portal, "
-                      "or no route off the LAN -- not the WiFi join itself");
     }
 
-    /* Always, on both paths: cleanup frees the socket and the parser state.
+    /* Always, on every path: cleanup frees the socket and the parser state.
      * Skipping it leaks a few KB per request, which one request survives and
-     * stage 5's once-a-minute loop would not. */
+     * stage 8's once-a-minute loop would not. */
     esp_http_client_cleanup(client);
 
-    ESP_LOGI(TAG, "stage 4 complete. heartbeat continues; power-cycle to re-run.");
+    ESP_LOGI(TAG, "stage 5 complete. heartbeat continues; power-cycle to re-run.");
     vTaskDelete(NULL);
 }
+
 
 /* --- setup -------------------------------------------------------------- */
 
@@ -492,7 +746,7 @@ void app_main(void)
      * fire -- and touch this group -- the instant the radio starts. */
     s_wifi_events = xEventGroupCreate();
 
-    ESP_LOGI(TAG, "stage 4: wifi + one http sanity check");
+    ESP_LOGI(TAG, "stage 5: wifi + one fetch of the real usage JSON");
     wifi_start();
 
     /* Block until connected. The four arguments after the group are:
@@ -520,7 +774,7 @@ void app_main(void)
      * task and below the WiFi driver's -- the same value ESP-IDF's own HTTP
      * example uses. The sixth parameter would receive a handle for later
      * control; we don't need one, because the task deletes itself. */
-    xTaskCreate(&http_sanity_task, "http_sanity", 8192, NULL, 5, NULL);
+    xTaskCreate(&usage_fetch_task, "usage_fetch", 8192, NULL, 5, NULL);
 
     /* Heartbeat, so a silent serial monitor means "the chip crashed or reset"
      * rather than leaving you guessing whether it is merely idle.

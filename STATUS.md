@@ -4,8 +4,8 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** stages 1-4 done and verified on hardware; stage 5
-(talk to the real `pc_service`, parse the JSON) is next.
+**One-line status:** stages 1-5 done and verified on hardware; stage 6
+(bring the proven GC9A01 driver into `firmware/`) is next.
 
 ## Done and verified
 
@@ -16,7 +16,8 @@ design) to resume cold.
 | display bring-up (GC9A01 wiring + init) | **verified on hardware** with a standalone solid-fill test; the driver still has to be brought into `firmware/` at stage 6 |
 | 3 — firmware WiFi | **done** — chip gets a lease on the same subnet as the PC |
 | 4 — HTTP client sanity check | **done** — 200 from example.com, full body over serial, heartbeat survives |
-| 5-8 | not started |
+| 5 — talk to the real `pc_service` | **done** — 200, parsed, values match what the PC serves field for field |
+| 6-8 | not started |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
 `service.py` (poll + cache + `GET /usage`). Pure stdlib, no venv.
@@ -55,6 +56,38 @@ re-litigating:
 559 bytes of body accumulated intact, and the heartbeat kept printing
 afterwards -- so the HTTP task neither overflowed its stack nor blocked
 anything else.
+
+## Stage 5 as built
+
+The stage-4 request machinery, pointed at the real service and given a
+parser. `json` (IDF's bundled cJSON, 1.7.19 in v5.3.5) joined `REQUIRES` the
+same way `esp_http_client` did -- no download, no `managed_components/`.
+The accumulator, the task, and the 8 KB stack are unchanged from stage 4.
+What is new:
+
+- **The URL is assembled from `secrets.h` at compile time**, not written
+  into the source: `"http://" PC_SERVICE_HOST ":" STRINGIFY(PC_SERVICE_PORT)
+  "/usage"`. The two-step `STRINGIFY` is required rather than decorative --
+  `#` stringifies its argument *before* expanding it, so a one-step version
+  would bake in the literal text `PC_SERVICE_PORT`. Verified by grepping the
+  built binary for the expanded string, which is also the cheapest way to
+  confirm the real host never lands in a tracked file.
+- **Only the two percentages are mandatory.** Reset times, the `updated`
+  pair and `now_epoch` are all allowed to be absent or JSON null by the
+  contract, so they parse into `""` / `0` and print as `--`. Three typed
+  accessors (`json_get_int`, `json_get_epoch`, `json_get_str`) do the type
+  check, and cJSON's type check handles null for free.
+- **200, 503, other statuses and truncation are four separate outcomes**,
+  each with its own message. A 503 is parsed for its `error` string by a
+  separate three-line function rather than through `parse_usage`, which
+  would only report the percentages as missing -- true, but unhelpful.
+- **Still one shot, not a loop.** The periodic refresh is stage 8; keeping
+  this single-shot means a failure is one request to read, not a scrolling
+  log.
+
+**Verified on hardware.** Status 200, 278 bytes, and a parsed block whose
+values match what the PC was serving at that moment field for field --
+checked against `curl` on the PC rather than eyeballed for plausibility.
 
 ## Facts established so far (don't re-derive)
 
@@ -120,8 +153,9 @@ anything else.
   checking what the router actually runs; that is how WPA3-only networks stop
   connecting.
 - **Connect time varies a lot, and `reason 2` (AUTH_EXPIRE) at startup is not
-  a fault.** Three observed boots: ~14s (fail, fail, connect), then 2.2s with
-  no retries, then ~20s (fail, fail, connect) again. Same code, same network.
+  a fault.** Four observed boots: ~14s (fail, fail, connect), then 2.2s with
+  no retries, then ~20s (fail, fail, connect), then ~22s at stage 5 (fail,
+  fail, fail, connect — three retries). Same code, same network.
   So retries are occasional, not characteristic — the delay in the disconnect
   handler is what makes the slow cases recover unattended. Don't chase
   reason-2 lines at startup, and don't read a fast connect as proof they're
@@ -151,10 +185,42 @@ anything else.
   boot:0x0 (USB_BOOT)` and prints `wait usb download`, which looks like a
   failed flash but is just the BOOT strap still low. Tapping `R` alone --
   without `B` -- boots the app normally.
-- **The app is using most of a 1 MB partition already.** Stage 4 builds to
-  0xe3500 bytes with 11% of the app partition free. WiFi plus the HTTP client
-  is most of that, and the display driver itself is small — but if stages 6-7
-  run out of room, a custom partition table is the fix, not code golf.
+- **The app is using most of a 1 MB partition already.** Stage 4 built to
+  0xe3500 with 11% of the app partition free; stage 5 is 0xe64b0 with 10%
+  free, so cJSON cost about 12 KB. WiFi plus the HTTP client is most of the
+  total, and the display driver itself is small — but if stages 6-7 run out
+  of room, a custom partition table is the fix, not code golf.
+- **`pc_service` sends a real `Content-Length`** (Python's `http.server`
+  does), so the chunked path stage 4 exercised does not come up against the
+  real service — the observed run was `content-length 278, body 278 bytes`.
+  The `-1` handling stays anyway: it costs one comparison, and it is the
+  difference between working and not if this ever moves behind a proxy.
+- **Reset epochs jitter by a second between polls.** Upstream sends
+  `resets_at` with sub-second precision and the service truncates to an int,
+  so the same reset instant can serve as `...799` on one poll and `...800`
+  on the next. The displayed `HH:MM` is rounded and does not move. Two
+  consequences: a "resets in 3h12m" countdown built on these epochs must not
+  treat them as stable to the second, and a one-second difference between two
+  observations is not evidence of a parsing bug (it briefly looked like one).
+- **Never read epochs out of cJSON's `valueint`.** cJSON stores every number
+  as both a double and an `int` clamped to `INT_MAX`. A Unix epoch (1.79e9)
+  still fits a 32-bit int today and stops fitting in 2038, at which point
+  `valueint` would silently pin to 2147483647 while `valuedouble` stays
+  exact (a double holds every integer to 2^53). `json_get_epoch` uses the
+  double deliberately.
+- **RSSI readings swing far too much to trust a single sample.** One capture
+  showed a steady -86/-87 dBm, and a reset a minute later — same board, same
+  position — showed a steady -62 dBm. So the "marginal signal" note above is
+  about the trend, not any one number; take several readings before moving
+  the board or blaming placement.
+- **`idf.py monitor` cannot be driven non-interactively** (it exits on a
+  keypress), which makes capturing a boot log awkward from a script. What
+  works: open the port with pyserial, set DTR low and pulse RTS — on the
+  C3's USB-Serial/JTAG peripheral RTS drives CHIP_PU, so that reboots
+  straight into the app rather than into download mode — then read for a
+  fixed number of seconds. Without the reset pulse you miss the boot
+  entirely, because `idf.py flash` has already reset the chip by the time
+  the port is reopened.
 - **Flash size was wrong and is now fixed.** IDF defaulted to 2MB; the XIAO
   ESP32-C3 has 4MB, so the bootloader logged "Detected size(4096k) larger
   than the size in the binary image header(2048k)" and stranded half the
@@ -249,15 +315,22 @@ file hashes.
 
 ## Next session — start here
 
-**Stage 5: talk to the real `pc_service`.** It reuses the accumulator
-from stage 4 almost unchanged; what is new is the URL (from `secrets.h`'s
-`PC_SERVICE_HOST`/`PC_SERVICE_PORT`, not a literal), cJSON parsing against
-the contract in `ARCHITECTURE.md`, and handling the 503 shape as a normal
-response rather than an error. `cJSON` comes from IDF's `json` component —
-add it to `REQUIRES` the same way `esp_http_client` was.
+**Stage 6: display bring-up inside `firmware/`.** The panel, the wiring and
+the vendor init sequence are already proven on hardware by the standalone
+solid-fill test (see the table above), so this stage is a port, not a
+bring-up from scratch: bring that hand-rolled `spi_master` + `gpio` driver
+into `firmware/main/`, keep `madctl = 0x08`, and fill the screen with a
+solid colour with nothing else in the way. Only then does stage 7 render the
+`usage_t` that stage 5 already fills in.
 
-`pc_service` must be **running** for stage 5 (see Housekeeping) — it was not
-needed for stage 4.
+Two things to carry across. The pinout is in `ARCHITECTURE.md` and is
+confirmed working — check GND/VCC against the board's silkscreen first if
+the screen is dark, since that failure mode is total darkness with clean
+serial logs. And the app partition is at 10% free: if the driver does not
+fit, the fix is a custom partition table, not shrinking code.
+
+`pc_service` does **not** need to be running for stage 6 — nothing in that
+stage talks to it. It is needed again from stage 7 on (see Housekeeping).
 
 ## Deferred, deliberately
 

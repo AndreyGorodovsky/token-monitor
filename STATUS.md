@@ -4,8 +4,8 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** stages 1-5 done and verified on hardware; stage 6
-(bring the proven GC9A01 driver into `firmware/`) is next.
+**One-line status:** stages 1-6 done and verified on hardware; stage 7
+(render the real values through the now-working display) is next.
 
 ## Done and verified
 
@@ -13,11 +13,12 @@ design) to resume cold.
 |---|---|
 | 1 — prove the API call | done, cross-checked against `/status` |
 | 2 — polling service + LAN endpoint | done, verified from a phone on WiFi and under a real HTTP 429 |
-| display bring-up (GC9A01 wiring + init) | **verified on hardware** with a standalone solid-fill test; the driver still has to be brought into `firmware/` at stage 6 |
+| display bring-up (GC9A01 wiring + init) | **verified on hardware** with a standalone solid-fill test, before the driver came near this project |
 | 3 — firmware WiFi | **done** — chip gets a lease on the same subnet as the PC |
 | 4 — HTTP client sanity check | **done** — 200 from example.com, full body over serial, heartbeat survives |
 | 5 — talk to the real `pc_service` | **done** — 200, parsed, values match what the PC serves field for field |
-| 6-8 | not started |
+| 6 — display inside `firmware/` | **done** — red/green/blue cycle correct on the panel, resting on blue, alongside a running WiFi radio |
+| 7-8 | not started |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
 `service.py` (poll + cache + `GET /usage`). Pure stdlib, no venv.
@@ -118,6 +119,40 @@ Two things the failure runs taught, both worth keeping:
   silently blocked and the chip sees a 10s timeout instead of the 503 you
   are trying to test -- a confusing way to lose ten minutes.
 
+## Stage 6 as built
+
+The driver moved into `firmware/main/` as its own module — `gc9a01.c` +
+`gc9a01.h`, not pasted into `token_monitor.c`, which is already long and has
+nothing to do with pixels. `esp_driver_spi` and `esp_driver_gpio` joined
+`REQUIRES` (the specific IDF 5.x components, not the legacy `driver`
+umbrella). The public surface is two functions, `gc9a01_init()` and
+`gc9a01_fill_screen()`; stage 7 adds the drawing primitives.
+
+- **Nothing that touches the panel changed.** The register table, the reset
+  timings, `madctl = 0x08` and the 10 MHz clock are byte-for-byte what was
+  proven on this board. That is the entire point: stage 6 changes only the
+  *surroundings* — a real project with a WiFi radio running — so a dark
+  screen would have one suspect, the environment.
+- **The clock stays at 10 MHz for now.** Many GC9A01 boards run at 40 MHz and
+  stage 7 will want the speed once it is redrawing regions, but raising it in
+  the same step as the move would have given a failure two suspects. Raise it
+  later, on its own, with the screen already working.
+- **It runs before `wifi_start()`.** The panel does not depend on the
+  network, so doing it first means the screen lights within a third of a
+  second of power-on instead of after a 20-second WiFi join — and a dark
+  screen cannot be blamed on WiFi that has not started yet.
+- **It rests on blue, not black.** Black was the obvious choice, being the
+  background stage 7 will draw onto. It is also exactly what a *dead panel*
+  looks like, so the resting state would have proved nothing to anyone who
+  missed the two-second colour cycle. Ending lit means the screen keeps
+  answering the question minutes later. Stage 7 clears to black as its first
+  act. (Caught after flashing, by trying to describe what to look for.)
+
+**Verified on hardware.** Red, green and blue each filled the whole round
+panel in the right order, then it settled on solid blue and stayed there,
+with WiFi associating and the usage fetch completing on the same boot. So
+SPI and the WiFi radio coexist, which was the actual open question.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -214,11 +249,32 @@ Two things the failure runs taught, both worth keeping:
   boot:0x0 (USB_BOOT)` and prints `wait usb download`, which looks like a
   failed flash but is just the BOOT strap still low. Tapping `R` alone --
   without `B` -- boots the app normally.
-- **The app is using most of a 1 MB partition already.** Stage 4 built to
-  0xe3500 with 11% of the app partition free; stage 5 is 0xe64b0 with 10%
-  free, so cJSON cost about 12 KB. WiFi plus the HTTP client is most of the
-  total, and the display driver itself is small — but if stages 6-7 run out
-  of room, a custom partition table is the fix, not code golf.
+- **The app is using most of a 1 MB partition, and the margin is shrinking.**
+  Stage 4 built to 0xe3500 (11% free); stage 5 to 0xe64b0 (10% free), cJSON
+  costing about 12 KB; stage 6 to 0xed7e0 (**7% free, about 74 KB**), the
+  display driver costing about 29 KB — nearly all of that being the
+  `spi_master` driver rather than our own code, which is a few hundred lines.
+  WiFi plus the HTTP client is still most of the total. Stage 7 adds font
+  data and drawing primitives on top of this. **If it stops fitting, the fix
+  is a custom partition table, not code golf** — there is a spare ~1 MB of a
+  4 MB flash sitting unused in the default table.
+- **A 429 now recurs with a single service instance at one poll per minute.**
+  This contradicts the earlier note that 1/min ran fine, and it met the
+  written trigger for revisiting `POLL_INTERVAL_SECONDS`. Observed over one
+  session: roughly one poll in three or four came back rate-limited, each
+  time backing off 120-240s and recovering. Plausible reason it appeared now
+  and not before: Claude Code itself calls this same endpoint to power its
+  own `/status`, so during an active session the service is not the only
+  caller competing for that limit. Nothing broke — the backoff did its job
+  and the chip was served real numbers flagged `stale: true` — but the poll
+  interval should probably go up (120-180s), since the data moves a couple
+  of percentage points over ten minutes and nothing is gained by asking
+  more often.
+- **The `stale: true` path has now been seen end to end on hardware**, as a
+  side effect of those 429s rather than by design: the chip parsed
+  `stale: YES` with `data age: 164s` and printed it correctly. That is the
+  third of the three response shapes, so all of them have now been exercised
+  for real rather than only in code review.
 - **`esp_http_client` sends no `Connection` header at all**, and under
   HTTP/1.1 that means keep-alive. The server therefore held the socket open
   after answering, with a thread parked in a read waiting for a second
@@ -357,22 +413,31 @@ file hashes.
 
 ## Next session — start here
 
-**Stage 6: display bring-up inside `firmware/`.** The panel, the wiring and
-the vendor init sequence are already proven on hardware by the standalone
-solid-fill test (see the table above), so this stage is a port, not a
-bring-up from scratch: bring that hand-rolled `spi_master` + `gpio` driver
-into `firmware/main/`, keep `madctl = 0x08`, and fill the screen with a
-solid colour with nothing else in the way. Only then does stage 7 render the
-`usage_t` that stage 5 already fills in.
+**Stage 7: render the real values through the working display.** Both halves
+now exist and are proven separately — `usage_t` is filled in from the network
+at stage 5, and the panel takes solid fills at stage 6. Stage 7 is the join:
+drawing primitives on top of `gc9a01_fill_screen`'s address-window mechanism
+(a rectangle fill is the same code with different bounds), then text.
 
-Two things to carry across. The pinout is in `ARCHITECTURE.md` and is
-confirmed working — check GND/VCC against the board's silkscreen first if
-the screen is dark, since that failure mode is total darkness with clean
-serial logs. And the app partition is at 10% free: if the driver does not
-fit, the fix is a custom partition table, not shrinking code.
+Four things worth knowing before starting:
 
-`pc_service` does **not** need to be running for stage 6 — nothing in that
-stage talks to it. It is needed again from stage 7 on (see Housekeeping).
+- **Text needs a font, and a font is data.** There is no text rendering in
+  the driver and nothing in IDF to borrow, so stage 7 either embeds a small
+  bitmap font or draws digits from segments. Whatever it is, it lands in the
+  74 KB of app partition still free — check `idf.py size` before and after.
+- **The panel is round.** The framebuffer is the full 240x240 square, and the
+  controller will happily take pixels in the corners that no one can see.
+  Anything that matters belongs inside the inscribed circle.
+- **A full-screen fill is 240 SPI transfers at 10 MHz.** Fine for stage 6's
+  once-at-boot cycle, and the reason stage 7 should redraw only the regions
+  that changed rather than repainting everything each refresh. Raising the
+  clock toward 40 MHz is the other half of that, and is worth doing as its
+  own change with the screen already working.
+- **Land on a layout rather than perfecting one** — `CLAUDE.md` says so
+  explicitly, and there is a deferred idea (the expressive face, below) that
+  will want to revisit the layout anyway once the free-flash number is known.
+
+`pc_service` must be **running** for stage 7, as it was for stage 5.
 
 ## Deferred, deliberately
 
@@ -380,9 +445,12 @@ stage talks to it. It is needed again from stage 7 on (see Housekeeping).
   firewall diagnosis on startup). Proposed, not built — `pc_service/README.md`
   covers the same ground in prose. Revisit at the polish stage if the chip is
   hard to debug.
-- **`POLL_INTERVAL_SECONDS` stays 60.** 2/min is known to trigger a 429, but
-  the real limit isn't; 1/min ran fine. Raise it only if 429s recur with a
-  single instance.
+- **`POLL_INTERVAL_SECONDS` is still 60, but its trigger has now fired.**
+  The rule was "raise it only if 429s recur with a single instance", and at
+  stage 6 they did — roughly one poll in three or four (see the facts list).
+  Proposed, not yet applied: 120-180s. Left alone deliberately rather than
+  changed mid-stage, since it is a behaviour change to a signed-off component
+  and it costs nothing to decide separately.
 - **The PC must be on.** Known v1 limitation; a future server/cloud relay
   would replace only the credential-reading layer. See `ARCHITECTURE.md`.
 - **Expressive face on the display, instead of numbers alone.** Requested
@@ -402,8 +470,9 @@ stage talks to it. It is needed again from stage 7 on (see Housekeeping).
   | Full-colour RGB565 sprite | ~28.8 KB at 120px | Four faces ≈ the entire remaining budget |
 
   Constraint that drives the choice: **a single 240x240 RGB565 frame is
-  115,200 bytes**, and stage 5 leaves about 103 KB free in the app
-  partition — so one full-screen stored frame does not fit at all, and
+  115,200 bytes**, and free space is shrinking as stages land — about 103 KB
+  after stage 5, about **74 KB after stage 6**, with stage 7's fonts still to
+  come — so one full-screen stored frame does not fit at all, and
   literal GIF playback is out unless the partition table changes. A GIF
   *decoder* would be the wrong tool regardless: the assets are fixed at
   build time, so shipping an LZW decoder to unpack something that could

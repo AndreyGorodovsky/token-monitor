@@ -33,14 +33,14 @@ Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 
 ## Where this is in the build order
 
-**Stage 5: fetch the real usage JSON and parse it** (`CLAUDE.md`'s build
-order) — written, flashed, and verified on hardware. The chip joins the
-network, makes a single plain-HTTP GET to `pc_service` on the LAN, parses the
-reply with cJSON against the contract in `../ARCHITECTURE.md`, and prints the
-parsed values over serial.
+**Stage 6: display bring-up** (`CLAUDE.md`'s build order) — written, flashed,
+and verified on hardware. On boot the chip now initializes the GC9A01 panel
+and cycles it through red, green and blue before resting on solid blue; then
+stage 5's WiFi join and usage fetch run as before, printing parsed values over
+serial. Nothing from the network reaches the screen yet — that join is stage 7.
 
-Stages 3 (WiFi only) and 4 (an HTTP GET to a throwaway URL) are done and were
-verified on hardware. The display comes in stages 6–8.
+Stages 3 (WiFi), 4 (HTTP to a throwaway URL) and 5 (the real service, parsed
+with cJSON) are done and were verified on hardware.
 
 Stage 4's throwaway URL was the point of *that* stage: it proved
 `esp_http_client` works on this chip and IDF version before `pc_service` was
@@ -71,6 +71,14 @@ idf.py -p COM3 flash monitor      REM adjust the port
 Expect roughly this, in this order:
 
 ```
+I (…) token_monitor: stage 6: display bring-up
+I (…) gc9a01: hardware reset...
+I (…) gc9a01: sending 42 vendor init commands...
+I (…) gc9a01: init done
+I (…) token_monitor:   fill: RED
+I (…) token_monitor:   fill: GREEN
+I (…) token_monitor:   fill: BLUE
+I (…) token_monitor: display ready (screen should now be solid BLUE and stay that way)
 I (…) token_monitor: stage 5: wifi + one fetch of the real usage JSON
 I (…) token_monitor: wifi started, connecting to "…"...
 I (…) token_monitor: got IP: 192.168.1.42
@@ -91,16 +99,20 @@ I (…) token_monitor: stage 5 complete. heartbeat continues; power-cycle to re-
 I (…) token_monitor: still connected, rssi -62 dBm
 ```
 
-Four things to actually check, not just glance at:
+Five things to actually check, not just glance at:
 
-1. **The IP is on the same subnet as the PC running `pc_service`.** A
+1. **The screen actually cycles red, green, blue and stays blue.** This is
+   the only check here that the serial log cannot make for you: SPI writes are
+   unacknowledged, so every line above prints identically into a panel that is
+   not plugged in.
+2. **The IP is on the same subnet as the PC running `pc_service`.** A
    different subnet means the chip landed on a guest network or a second AP,
    and no firewall rule will fix that.
-2. **`status 200`, and a `parsed` block rather than a raw body.** If the
+3. **`status 200`, and a `parsed` block rather than a raw body.** If the
    parse fails, the firmware prints the raw bytes between `body` markers
    instead — that dump *is* the diagnosis: an HTML error page means something
    other than `pc_service` answered on that port.
-3. **The numbers match what the PC serves.** Hit
+4. **The numbers match what the PC serves.** Hit
    `http://<PC_SERVICE_HOST>:<port>/usage` from a browser on the same network
    and compare. They should agree field for field — this stage exists to prove
    the contract, not just the connection.
@@ -114,7 +126,7 @@ Four things to actually check, not just glance at:
    servers.) And **the reset epochs can differ by a second between polls**:
    upstream sends sub-second precision that gets truncated, so the epoch
    jitters while the displayed `HH:MM` string does not.
-4. **The heartbeat keeps printing afterwards.** A monitor that goes silent
+5. **The heartbeat keeps printing afterwards.** A monitor that goes silent
    right after the request means the HTTP task crashed — most likely a stack
    overflow, which prints a `***ERROR*** A stack overflow in task` panic just
    before the reboot.
@@ -132,6 +144,9 @@ data" screen.
 
 | Symptom | Likely cause |
 |---|---|
+| Screen completely dark, no backlight glow | Power, not signal — check GND/VCC against the board's silkscreen first. The backlight is tied straight to VCC with no control pin, so a power fault is *total* darkness, and the serial log stays clean regardless |
+| Screen lit but colours wrong or inverted | Calibration, not wiring: `madctl` in `gc9a01.c` (try `0x00` or `0x48`), or the inversion command `0x21` |
+| Screen lit but streaky, noisy, or partial | Signal integrity — most likely the 10 MHz SPI clock over long jumper wires, or a loose SCL/SDA/DC line |
 | Build error naming `secrets.h` | You haven't copied `secrets.h.example` to `secrets.h` yet |
 | `disconnected (reason 201)` repeating | AP not found — wrong SSID, or the network is 5 GHz only |
 | `disconnected (reason 15)` or `(reason 2)` | Handshake failed — wrong password. A few `reason 2` retries *at startup* are normal and recover on their own |
@@ -148,10 +163,45 @@ data" screen.
 | `Failed to connect … No serial data received` while flashing | Auto-reset into download mode did not take. Hold `B`, tap `R`, release `B`, then flash |
 | Boots to `boot:0x0 (USB_BOOT)` and `wait usb download` | Still in download mode after a manual `B`+`R` flash. Tap `R` alone — do not hold `B` — to boot the app |
 
-## Display code (stages 6-7)
+## Display code (`main/gc9a01.c`)
 
-The GC9A01 driver is hand-rolled on plain `spi_master` + `gpio` — no
-`esp_lcd`, no Component Registry dependency. The init sequence and
-`madctl = 0x08` are confirmed correct on this panel. Stage 6 brings it up
-standalone (solid colour fill) before stage 7 renders real data through it.
-See `../ARCHITECTURE.md` for the pinout and the reasoning.
+Hand-rolled on plain `spi_master` + `gpio` — no `esp_lcd`, no Component
+Registry dependency, nothing to download. The init sequence and
+`madctl = 0x08` are confirmed correct on this panel. See
+`../ARCHITECTURE.md` for the pinout and the reasoning.
+
+The interface is two functions wide on purpose (`gc9a01_init`,
+`gc9a01_fill_screen`); stage 7 adds rectangle fills and text on top of the
+same address-window mechanism.
+
+**What stage 6 puts on the screen**, in the first two and a half seconds
+after reset:
+
+```
+I (422) gc9a01: hardware reset...
+I (582) gc9a01: sending 42 vendor init commands...
+I (722) gc9a01: init done
+I (722) token_monitor:   fill: RED
+I (1312) token_monitor:   fill: GREEN
+I (1902) token_monitor:   fill: BLUE
+I (2582) token_monitor: display ready (screen should now be solid BLUE and stay that way)
+```
+
+Three colours rather than one, and it rests **lit** rather than black. Both
+are deliberate. A single fill could be a screen stuck on a colour from a
+previous run, whereas a sequence proves the chip is genuinely driving the
+panel — and that red, green and blue arrive as red, green and blue, which is
+what confirms `madctl = 0x08`. Resting on blue matters because a black screen
+and a *dead* screen look identical, so the resting state would otherwise
+prove nothing to anyone who missed the cycle.
+
+The display is initialized **before** WiFi starts: the panel does not need the
+network, the screen lights within a third of a second instead of after a
+20-second join, and a dark screen cannot be blamed on WiFi that has not
+started yet.
+
+If the screen stays completely dark, **check GND and VCC against the board's
+silkscreen before anything else.** This panel ties its backlight straight to
+VCC with no control pin, so a power fault shows as total darkness — and the
+serial log stays perfectly clean throughout, because SPI writes are
+unacknowledged. A clean log is not evidence the panel is connected.

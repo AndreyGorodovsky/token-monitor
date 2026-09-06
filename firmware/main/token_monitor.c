@@ -78,6 +78,9 @@
                                       * client was; no download needed)     */
 #include "esp_log.h"                 /* ESP_LOGI / ESP_LOGW / ESP_LOGE      */
 
+#include "gc9a01.h"                  /* stage 6: the round display driver,
+                                      * hand-rolled on spi_master + gpio    */
+
 #include "secrets.h"                 /* YOUR values -- gitignored           */
 
 /* Every log line we emit is prefixed with this, so our messages stay
@@ -760,6 +763,41 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    /* --- stage 6: the display, before anything network-shaped -------------
+     *
+     * Deliberately first. The panel does not depend on WiFi, and doing it here
+     * means two things: the screen shows something within a third of a second
+     * of power-on rather than after a 20-second WiFi join, and a dark screen
+     * cannot be blamed on the network because the network has not started yet.
+     *
+     * The colour cycle is the actual test. A single fill would leave a screen
+     * that might simply be *stuck* on one colour from a previous run; three
+     * colours in sequence prove the chip is genuinely driving the panel, and
+     * that red, green and blue come out as red, green and blue (which is what
+     * confirms madctl = 0x08 is right for this board).
+     *
+     * It then rests on blue rather than black, deliberately. Black would be
+     * the natural background for stage 7 -- but at this stage a black screen
+     * and a dead panel look exactly alike, so the resting state would prove
+     * nothing to anyone who missed the two-second cycle. Ending on a lit
+     * colour means the screen is still answering the question minutes later.
+     * Stage 7 clears to black as its first act. */
+    ESP_LOGI(TAG, "stage 6: display bring-up");
+    gc9a01_init();
+
+    static const struct { const char *name; uint16_t color; } probe[] = {
+        { "RED",   GC9A01_RED   },
+        { "GREEN", GC9A01_GREEN },
+        { "BLUE",  GC9A01_BLUE  },
+    };
+    for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+        ESP_LOGI(TAG, "  fill: %s", probe[i].name);
+        gc9a01_fill_screen(probe[i].color);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    gc9a01_fill_screen(GC9A01_BLUE);
+    ESP_LOGI(TAG, "display ready (screen should now be solid BLUE and stay that way)");
 
     /* Must exist before wifi_start(), because the handlers it registers can
      * fire -- and touch this group -- the instant the radio starts. */

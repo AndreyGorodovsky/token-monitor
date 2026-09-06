@@ -138,8 +138,8 @@ data" screen.
 | `disconnected (reason 205)`, intermittent | Weak signal; check the antenna is attached to the XIAO |
 | Got an IP, but on the wrong subnet | Joined the wrong network (guest WiFi / neighbouring AP) |
 | Monitor totally silent | Wrong COM port, or the chip is in bootloader mode — reset it |
-| `request failed: ESP_ERR_HTTP_CONNECT` | `pc_service` is not running, the PC firewall is blocking the port, or `PC_SERVICE_HOST` is stale. Stage 4 already proved the chip's own networking |
-| `request failed: ESP_ERR_HTTP_EAGAIN` | Timed out after 10s — the PC is reachable but not answering |
+| `request failed: ESP_ERR_HTTP_CONNECT` | `pc_service` is not running, the PC firewall is blocking the port, or `PC_SERVICE_HOST` is stale. Stage 4 already proved the chip's own networking. Expect this to take the **full 10s**: Windows drops packets to a closed port rather than refusing them, so there is no fast "connection refused" — and no way to tell "not running" from "blocked" by timing alone |
+| `request failed: ESP_ERR_HTTP_EAGAIN` | Timed out after 10s with the connection already open — the PC answered, then stopped mid-response |
 | `body is not valid JSON` | Something other than `pc_service` answered on that port; the raw body printed underneath says what |
 | `five_hour_pct/seven_day_pct are missing` | The two sides disagree about the contract — change both together, per `../ARCHITECTURE.md` |
 | `pc_service has no data yet (503)` | Expected right after starting the service, or while it is rate-limited upstream. Check `pc_service`'s own log |

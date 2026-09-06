@@ -89,6 +89,35 @@ What is new:
 values match what the PC was serving at that moment field for field --
 checked against `curl` on the PC rather than eyeballed for plausibility.
 
+### All three response paths verified, not just the happy one
+
+The 200 path is the one that proves the contract, but it is the *degraded*
+paths that the definition of done cares about ("degrades visibly, not
+silently"), and code that has never run is not evidence of anything. Both
+were exercised deliberately on hardware, neither needed a reflash:
+
+- **Service unreachable** — stop `pc_service`, reset the chip. Result:
+  `ESP_ERR_HTTP_CONNECT` with the three-suspect hint, heartbeat continuing.
+- **503, no data yet** — a throwaway stub on the same port answering the
+  documented `{stale, error}` shape (kept at
+  `pc_service/tools/stub_503.py`). Result: `pc_service has no data yet
+  (503): upstream request failed`, logged as a warning, heartbeat
+  continuing. Reusable at stage 8, when this becomes a screen rather than a
+  log line.
+
+Two things the failure runs taught, both worth keeping:
+
+- **A closed port costs the full 10s timeout, not an instant refusal.**
+  Windows drops packets to a port nothing is listening on rather than
+  sending a TCP reset, so the connect attempt black-holes until
+  `timeout_ms` expires. Consequence: "`pc_service` isn't running" and "the
+  firewall is blocking it" are indistinguishable by timing, which is why
+  the error message names both.
+- **The stub has to run under the same `python.exe` as `pc_service`.** The
+  Windows firewall rule is per-program, so a different interpreter is
+  silently blocked and the chip sees a 10s timeout instead of the 503 you
+  are trying to test -- a confusing way to lose ten minutes.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -190,6 +219,19 @@ checked against `curl` on the PC rather than eyeballed for plausibility.
   free, so cJSON cost about 12 KB. WiFi plus the HTTP client is most of the
   total, and the display driver itself is small — but if stages 6-7 run out
   of room, a custom partition table is the fix, not code golf.
+- **`esp_http_client` sends no `Connection` header at all**, and under
+  HTTP/1.1 that means keep-alive. The server therefore held the socket open
+  after answering, with a thread parked in a read waiting for a second
+  request that was never coming; when the chip closed, that pending read
+  surfaced on Windows as an abort (`WinError 10054`) rather than a clean EOF,
+  and `pc_service` printed a full traceback for every single fetch. Harmless
+  once, but stage 8 would have printed one a minute forever and buried real
+  errors. Fixed on both ends: the firmware now sends `Connection: close`
+  (right for a once-a-minute poll -- no server holds an idle connection open
+  that long anyway), and `handle_one_request` swallows the two
+  connection-loss errors for every other client. **The firmware side is the
+  actual fix**, proven by a deliberately unguarded stub server taking the
+  request and logging zero tracebacks.
 - **`pc_service` sends a real `Content-Length`** (Python's `http.server`
   does), so the chunked path stage 4 exercised does not come up against the
   real service — the observed run was `content-length 278, body 278 bytes`.

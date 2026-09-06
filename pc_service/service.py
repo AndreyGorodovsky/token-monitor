@@ -297,16 +297,46 @@ class UsageServer(ThreadingHTTPServer):
 
 class UsageHandler(BaseHTTPRequestHandler):
     cache = None                                  # injected in main()
-    protocol_version = "HTTP/1.1"                 # the ESP32 client prefers keep-alive
+    protocol_version = "HTTP/1.1"                 # so Content-Length is honoured
 
-    # HTTP/1.1 means keep-alive, and each connection holds a thread parked in
-    # readline() waiting for the next request. Without a timeout that wait is
-    # unbounded: an ESP32 that reboots, gets reflashed, or drops off WiFi
+    # HTTP/1.1 defaults to keep-alive, and each kept-alive connection holds a
+    # thread parked in readline() waiting for the next request. Without a
+    # timeout that wait is unbounded: a client that reboots or drops off WiFi
     # mid-connection never sends FIN, so the thread blocks forever (Windows
     # leaves TCP keepalive off, so nothing reaps it either). On an always-on
     # service that is one leaked thread per reflash, accumulating for the
     # life of the process.
+    #
+    # The firmware now sends "Connection: close", so it no longer parks a
+    # thread at all -- but this timeout stays for every other client (a
+    # browser tab left open on /usage does exactly what the ESP32 used to).
     timeout = 30
+
+    def handle_one_request(self):
+        """Serve one request, treating a vanished client as routine.
+
+        A client that closes mid-connection is normal here, not exceptional:
+        the ESP32 sends one request, closes, and reboots or sleeps until the
+        next poll. Because HTTP/1.1 keeps the connection open, that close
+        lands on a socket this thread is already reading from, and on Windows
+        it surfaces as a reset (WinError 10054) rather than a clean EOF --
+        which BaseHTTPRequestHandler does not catch, so it escapes as an
+        unhandled exception and prints a full traceback per disconnect.
+
+        Nothing breaks: the connection's own thread dies and the service
+        carries on. But at one poll a minute this would print a traceback a
+        minute, forever, and the cost of that is real -- it buries the
+        failures that do matter in noise that means nothing. So catch it, note
+        it at most in passing, and let the thread end quietly.
+
+        Deliberately narrow: only the two connection-loss errors are caught.
+        Anything else still escapes with its traceback intact, because a bug
+        in do_GET must stay loud.
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def _respond(self, status, body):
         encoded = json.dumps(body).encode("utf-8")

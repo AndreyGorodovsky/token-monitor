@@ -424,10 +424,12 @@ static bool parse_usage(const char *json, int len, usage_t *out)
         json_get_epoch(root, "updated_epoch",          &out->updated_epoch);
         json_get_epoch(root, "now_epoch",              &out->now_epoch);
 
-        /* cJSON_IsTrue is false for absent, null, and non-boolean alike, which
-         * is the safe default here: unknown freshness reads as fresh and is
-         * caught by the age check instead, rather than flashing a stale badge
-         * because of a typo'd field name. */
+        /* cJSON_IsTrue is false for absent, null, and non-boolean alike. That
+         * is the safe default because it is not the only freshness signal:
+         * updated_epoch against now_epoch gives the true age independently, so
+         * a missing `stale` field degrades to "trust the clock" rather than
+         * flashing a stale badge over a typo'd field name. Stage 8 is where
+         * that age becomes a decision rather than a printed number. */
         out->stale = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "stale"));
     }
 
@@ -539,6 +541,23 @@ static void usage_fetch_task(void *arg)
         vTaskDelete(NULL);
         return;                  /* unreachable; states the intent clearly */
     }
+
+    /* Ask the server to close the connection once it has answered.
+     *
+     * esp_http_client sends no Connection header of its own, and under
+     * HTTP/1.1 the absence of one means keep-alive. That leaves the server
+     * holding the socket open after it replies, with a thread parked in a
+     * read waiting for a second request that is never coming -- this client
+     * makes one request and then closes. On Windows that close arrives on the
+     * pending read as an abort (WinError 10054) rather than a clean
+     * end-of-file, and pc_service printed a traceback for every fetch.
+     *
+     * Saying "close" out loud fixes both ends: the server closes the socket
+     * itself, in order, and nothing is left parked. Keep-alive would be worth
+     * having if this polled every few seconds, but stage 8 polls once a
+     * minute -- far longer than any server holds an idle connection open, so
+     * the connection would be dead before the next request anyway. */
+    esp_http_client_set_header(client, "Connection", "close");
 
     /* perform() blocks until the whole exchange finishes: connect, request,
      * response, and every on_http_event call above. Note this is NOT wrapped

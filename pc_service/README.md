@@ -141,3 +141,23 @@ going blank.
 
 The service re-reads the credential file on every poll, so a token refreshed
 by Claude Code is picked up automatically without a restart.
+
+## Testing the firmware's "no data" path (`tools/stub_503.py`)
+
+The firmware has to handle a **503** — `pc_service` up, but no successful
+poll yet, so there is no data to serve even as stale. That state is real but
+awkward to catch on purpose, since the service leaves it within a poll or
+two of starting.
+
+`tools/stub_503.py` stands in for the service and answers every request with
+the documented 503 shape, so the firmware's branch can be exercised on
+demand. Stop `service.py` first — the stub binds the same port:
+
+```
+python tools/stub_503.py
+```
+
+Run it with the **same `python.exe`** the real service uses. The Windows
+firewall rule that lets the ESP32 reach this machine is per-program, so a
+different interpreter is silently blocked and the chip sees a 10-second
+timeout instead of the 503 you meant to test.

@@ -494,12 +494,21 @@ Four things worth knowing before starting:
   firewall diagnosis on startup). Proposed, not built — `pc_service/README.md`
   covers the same ground in prose. Revisit at the polish stage if the chip is
   hard to debug.
-- **`POLL_INTERVAL_SECONDS` is still 60, but its trigger has now fired.**
-  The rule was "raise it only if 429s recur with a single instance", and at
-  stage 6 they did — roughly one poll in three or four (see the facts list).
-  Proposed, not yet applied: 120-180s. Left alone deliberately rather than
-  changed mid-stage, since it is a behaviour change to a signed-off component
-  and it costs nothing to decide separately.
+- **`POLL_INTERVAL_SECONDS` was raised from 60 to 120** — its written trigger
+  ("raise it only if 429s recur with a single instance") fired at stage 6.
+  Measured over an hour at 60s: 13 of 45 polls refused, in a metronomic
+  two-ok-then-one-429 cycle. The next step if they reappear is 180s; the real
+  limit remains unknown and undocumented.
+
+  Worth keeping the reasoning, because the obvious motive is the wrong one.
+  The problem was never freshness — the 120s backoff after each 429 meant the
+  real cadence was *already* one successful poll every ~111s, so 120s changes
+  almost nothing about how current the data is. The problem was that a 429
+  makes the service serve its last good payload with `"stale": true`, so a
+  third of responses flagged perfectly good two-minute-old data as stale.
+  Stage 7 draws that flag. An indicator that cries wolf a third of the time
+  is one you learn to ignore, and then it fails to tell you the thing it
+  exists for — that the PC is asleep or the service is dead.
 - **The PC must be on.** Known v1 limitation; a future server/cloud relay
   would replace only the credential-reading layer. See `ARCHITECTURE.md`.
 - **Expressive face on the display, instead of numbers alone.** Requested

@@ -77,9 +77,11 @@ with microseconds, which is both awkward to hand a microcontroller and the
 wrong value to show a person directly — convert it before it leaves this
 service (see the contract below).
 
-**Polling.** Poll on an interval (60s is a reasonable default — this is a
+**Polling.** Poll on an interval (**120s** as implemented — this is a
 subscription usage counter, not something that needs sub-minute freshness,
-and polling less often is politer to an undocumented endpoint). Keep the
+and polling less often is politer to an undocumented endpoint. 60s was the
+original default and proved too fast: it drew a steady stream of 429s even
+from a single instance. See `STATUS.md`). Keep the
 last successfully-fetched result in memory. If a poll fails, keep serving
 the last good result but mark it stale (see contract below) rather than
 blanking it.
@@ -167,8 +169,11 @@ serial is the only debugging channel until the display path is working.
 **HTTP client.** `esp_http_client`, GET to `pc_service`'s LAN IP:port
 (itself from the same gitignored config — it'll change if the PC's IP
 changes, so make it easy to update, not buried deep in code). Poll on an
-interval matching or slightly looser than `pc_service`'s own polling (e.g.
-every 60s) — no need to poll faster than the data actually changes.
+interval matching or slightly looser than `pc_service`'s own polling — no
+need to poll faster than the data actually changes, and nothing new appears
+between the service's own polls anyway. The brief asks for a 30-60s refresh
+on the display, which is fine: the chip is reading a local cache, not the
+upstream endpoint, so its interval and the service's are independent.
 
 **JSON parsing.** `cJSON` (ESP-IDF's `json` component) against the contract
 above.

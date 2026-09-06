@@ -43,7 +43,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from fetch_usage import RateLimited, fetch_usage, read_access_token
 
 DEFAULT_PORT = 8734
-POLL_INTERVAL_SECONDS = 60      # the numbers move slowly; be polite upstream
+# The numbers move slowly, and the endpoint is undocumented -- so the interval
+# is set by what upstream tolerates, not by what the display could use.
+#
+# This was 60s, on the evidence that two instances polling earned a 429 and one
+# did not. That stopped being true: at 60s with a single instance, 13 of 45
+# polls over an hour came back 429, in a metronomic two-ok-then-one-refused
+# cycle. (A plausible reason it changed: Claude Code itself calls this endpoint
+# for its own /status, so during an active session this service is not the only
+# caller spending the budget.)
+#
+# 120s costs almost nothing in freshness, because the 120s backoff after each
+# 429 meant the real cadence was already one *successful* poll every ~111s. The
+# reason to care is not staleness but honesty: a 429 makes the service serve
+# its last good payload with "stale": true, so at 60s the display would have
+# flagged perfectly good two-minute-old data as stale about a third of the
+# time -- and an indicator that cries wolf that often is one you learn to
+# ignore, which defeats the point of having it.
+#
+# If 429s reappear at 120s, 180s is the next step. The real limit is unknown.
+POLL_INTERVAL_SECONDS = 120
 RETRY_INTERVAL_SECONDS = 20     # after a failure, recover faster than a full cycle
 
 # A 429 is the server explicitly asking us to stop. Retrying it on the normal

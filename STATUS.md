@@ -445,6 +445,115 @@ computed age are independent signals, and the flag alone has to be enough to
 raise the badge — that is the case where `pc_service` is alive and its own
 upstream call failed.
 
+### Review pass on stage 8
+
+Seven findings, all verified against the code before being accepted, all
+fixed. The state machine itself came through clean — boot, association
+failure, mid-run drop, recovery, outage and both staleness tiers were traced
+and were right, as were every new buffer size and the row-band geometry. What
+the review found instead was one operational bug in the new tooling, two
+latent ways for the WiFi recovery to stop recovering, and three claims that
+were not true.
+
+**The one that mattered: `stub_stale.py` could bind beside a running
+service.** `service.py` sets `allow_reuse_address = sys.platform != "win32"`
+for a documented reason — on Windows `SO_REUSEADDR` lets a second process bind
+a port that is *already actively listening*. The new stub used a plain
+`HTTPServer` and inherited the flag, so it would have bound alongside the real
+service and Windows would have split incoming connections between the two.
+The chip would then show real data on some polls and stubbed data on others,
+which reads as the firmware flapping rather than as the obvious mistake it is.
+
+Worse, the stub's docstring asserted the opposite — "the second one to start
+fails loudly rather than sharing it" — and that claim was copied into
+`STATUS.md` and `firmware/README.md`. True of `service.py`, false of the stub.
+Both stubs now use a `StubServer` subclass carrying the same platform-
+conditional flag, which makes all three statements true; **verified by
+starting the stub beside the running service and getting WinError 10048.**
+`stub_503.py` had the same flaw and was fixed with it.
+
+This is the third time in this repo the bug has been in *documentation the
+change invalidated* rather than in the change, and the second time a review
+caught it. The stage 7 notes above say the same thing. Evidently it is the
+characteristic failure here, not a one-off.
+
+**`++s_retry_count` was a side effect inside `ESP_LOGW`.** It expands to
+`if (LOG_LOCAL_LEVEL >= ESP_LOG_WARN) ...`, so lowering the build's log level
+past WARN deletes the increment along with the message. Harmless while the
+counter only fed a printed number — which is why it survived from stage 3 —
+and *not* harmless from the moment stage 8's `reconnect_delay_ms()` started
+reading it: the tally would sit at zero, the backoff would flatten to a fixed
+2s, and an absent router would be probed eighteen hundred times an hour. The
+backoff would have disappeared silently, from a config change in a different
+file. Latent today (`CONFIG_LOG_DEFAULT_LEVEL_INFO`), and now hoisted to its
+own line.
+
+Worth generalising: the fix at stage 8 did not introduce this line, it made an
+existing line load-bearing. Adding a reader to an old variable is a change to
+that variable's requirements.
+
+**A synchronous `esp_wifi_connect()` failure ended the retry chain.** Every
+retry is driven by `WIFI_EVENT_STA_DISCONNECTED` re-arming the timer — but
+that event only exists if an association was actually attempted. If the call
+failed outright, nothing was posted, nothing re-armed, and the chip would sit
+on `NO WIFI` until power-cycled, with nothing in the log. That is a direct
+contradiction of the one thing stage 8 promises about WiFi. The callback now
+logs and re-arms itself, bumping the tally so a persistent failure backs off
+rather than spinning.
+
+**A link dropping mid-request was reported as `NO LINK`.** WiFi is checked at
+the top of the loop, but the request that follows can spend a full ten seconds
+in timeout. A drop inside that window landed on the connect-failure branch and
+blamed the PC — the exact misdiagnosis the `NO WIFI` / `NO LINK` split was
+added to prevent. That branch now re-checks the bit before naming a culprit.
+
+**`draw_centred`'s truncation guard measured the square, not the circle.**
+`GC9A01_WIDTH / cell` is the right answer on a rectangular panel. On this one
+the usable width depends on the row: at `ROW_7D_RESET` about 190px are inside
+the bezel, so the guard permitted 20 characters where 15 are visible. The
+failure it allowed is the one the guard exists to prevent — the `">"` marking
+a deliberate truncation would itself have been drawn outside the circle, so an
+over-long string would have lost glyphs off *both* ends with nothing on screen
+to say so. Reachable from network data, since reset times come from the PC and
+the contract allows a longer non-English weekday.
+
+Two things to keep from this. Stage 8 did the circle arithmetic carefully for
+the banner row and left every other row on the square assumption — doing the
+sum once does not mean it has been done. And the correct measurement is not
+simply "the bottom of the glyph": for text *above* centre the top row is the
+narrow one, so it is whichever edge is further from the middle. The fix takes
+the max of the two, needs no floating point (a 120-iteration integer square
+root), and independently reproduces `BANNER_MAX_CHARS = 12`, which is a
+pleasant check on both pieces of arithmetic.
+
+**The 40 MHz comment claimed spec compliance it does not have.** It said 40
+MHz "is what most GC9A01 boards are specified for". The controller's datasheet
+gives a 100 ns minimum serial write cycle — that is 10 MHz. 40 MHz is a
+widely-used *overclock* that works on this board and has been checked, not a
+guarantee about any board. In a project whose stated goal is being understood,
+that was the one claim a reader would carry away wrong.
+
+The reviewer added a genuinely useful second point: `PIN_SCLK`/`PIN_MOSI` are
+GPIO4/5, which are SPI2 IOMUX pins for HD and WP but **not** for CLK and MOSI,
+so these signals route through the GPIO matrix — whose documented ceiling for
+an SPI master is exactly 40 MHz. So this sits at the limit with no headroom:
+going faster would mean rewiring to the IOMUX pins, not editing a constant.
+
+**Also fixed, from the same review:** both stubs are now `ThreadingHTTPServer`
+with a 30s handler timeout. They serve HTTP/1.1, so keep-alive is the default,
+and on a single-threaded server one parked connection blocks every other
+client — meaning the obvious way to check a stub (open it in a browser) would
+have held its only thread, starved the ESP32's next poll, and produced
+`NO LINK`: the opposite of the branch the tool exists to exercise.
+
+**Re-verified on hardware after the fixes.** Clean build, no warnings, 7% of
+the app partition still free. Three refreshes at t=4.3s, 49.4s, 94.5s — the
+45s cadence intact — with the heap flat at ~192 KB and the live readings
+moving (5h 56→57%, 7d 14→15%), so the partial-redraw path ran against real
+changes rather than only against identical payloads. The reworked stub was
+confirmed serving a 2400s age with `stale: true`, and confirmed refusing to
+start beside the running service.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -504,6 +613,15 @@ upstream call failed.
   `SPI_CLOCK_HZ` in `gc9a01.c` back to 10 MHz is the one-line thing to rule
   out first — long jumpers are the usual reason a panel that works at 10 does
   not work at 40.
+
+  Two caveats, both from the stage 8 review and both worth keeping. **40 MHz
+  is an overclock, not a spec figure:** the GC9A01 datasheet gives a 100 ns
+  minimum serial write cycle, i.e. 10 MHz, so this is a measurement about this
+  board rather than a guarantee about any board. And **there is no headroom
+  above it** — `PIN_SCLK`/`PIN_MOSI` are GPIO4/5, which are SPI2 IOMUX pins
+  for HD and WP but not for CLK and MOSI, so these signals go through the GPIO
+  matrix, whose documented maximum for an SPI master is exactly 40 MHz. Going
+  faster is a rewiring job, not a constant.
 - **Free heap sits at roughly 191-192 KB with the refresh loop running**, and
   stays there across successful fetches, failed fetches and recoveries alike.
   That is the number to watch: this is the first code in the project that runs
@@ -883,6 +1001,9 @@ blank overnight: those numbers are hours old, and the display says so.
 branches on demand rather than by waiting: `stub_503.py` (the "no data yet"
 state) and `stub_stale.py <seconds> [--flag]` (data of any chosen age, and the
 `stale` flag independently). Stop the real service first — both bind 8734, and
-the second to start fails loudly rather than sharing it. Run them with the same
-`python.exe` the real service uses, since the Windows firewall rule is
-per-program.
+the second to start fails loudly (`WinError 10048`) rather than sharing the
+port. That is not automatic: it works because the stubs carry the same
+`allow_reuse_address = sys.platform != "win32"` that `service.py` does, without
+which Windows lets a second process bind an already-listening port and splits
+connections between them. Run them with the same `python.exe` the real service
+uses, since the Windows firewall rule is per-program.

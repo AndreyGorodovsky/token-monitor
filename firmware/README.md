@@ -221,9 +221,13 @@ python tools/stub_stale.py 60 --flag  # fresh, but flagged stale by the PC
 
 That last form is worth running at least once: the `stale` flag and the
 computed age are independent signals, and the flag alone has to be enough to
-raise the badge. Run them with the same `python.exe` the real service uses —
-the Windows firewall rule is per-program, so a different interpreter is
-silently blocked and the chip sees a timeout instead of a reply.
+raise the badge. Forgetting to stop the real service is safe — the second
+process fails at bind time with `WinError 10048` rather than quietly sharing
+the port, which would otherwise split the chip's polls between the two and
+look like the firmware flapping. Run them with the same `python.exe` the real
+service uses — the Windows firewall rule is per-program, so a different
+interpreter is silently blocked and the chip sees a timeout instead of a
+reply.
 
 For `NO LINK`, just stop the service and watch: the numbers stay, the banner
 appears within about a minute, and both clear on their own when it comes back.
@@ -293,9 +297,13 @@ from flashing.
 
 The SPI clock is **40 MHz**, raised from 10 at stage 8 once the screen was
 known-good — deliberately on its own, so that a failure would have one suspect
-rather than two. If the panel ever goes streaky after a rewiring, put
-`SPI_CLOCK_HZ` back to 10 MHz first: long jumper wires are the usual reason a
-display that works at 10 does not work at 40.
+rather than two. Two things to know about that number: it is a widely-used
+**overclock, not a spec figure** (the GC9A01 datasheet's 100 ns minimum write
+cycle is 10 MHz), and it has no headroom above it, because `PIN_SCLK`/
+`PIN_MOSI` are not the SPI2 IOMUX pins for CLK/MOSI and so route through the
+GPIO matrix, whose master ceiling is exactly 40 MHz. If the panel ever goes
+streaky after a rewiring, put `SPI_CLOCK_HZ` back to 10 MHz first: long jumper
+wires are the usual reason a display that works at 10 does not work at 40.
 
 **The panel self-test**, in the first two and a half seconds after reset:
 

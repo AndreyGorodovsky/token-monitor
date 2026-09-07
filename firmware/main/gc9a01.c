@@ -91,10 +91,25 @@ static const char *TAG = "gc9a01";
 
 /* Raised from 10 MHz to 40 MHz at stage 8, which is what the earlier version
  * of this comment said to do: on its own, with the screen already working, so
- * a failure has one suspect rather than two. 10 MHz was the number this panel
- * was *proven* at over jumper wires during bring-up; 40 MHz is what most
- * GC9A01 boards are specified for, and it is what makes stage 8's partial
- * redraws cheap enough to be invisible.
+ * a failure has one suspect rather than two. It is what makes stage 8's
+ * partial redraws cheap enough to be invisible.
+ *
+ * Be clear about what 40 MHz is, though, because the honest version is more
+ * useful than the flattering one: it is a **widely-used overclock, not a spec
+ * figure**. The GC9A01 datasheet gives a minimum serial write cycle of 100 ns
+ * -- that is 10 MHz, and 10 MHz is the number this panel was actually *proven*
+ * at over jumper wires during bring-up. Running at 40 works here, and has been
+ * checked on hardware (see ../../STATUS.md), but it is outside what the
+ * controller promises, so it is a measurement about this board rather than a
+ * guarantee about any board.
+ *
+ * There is a second ceiling in the way, from the other end. PIN_SCLK and
+ * PIN_MOSI are GPIO4 and GPIO5, which are SPI2 IOMUX pins for HD and WP but
+ * *not* for CLK and MOSI -- so these signals route through the GPIO matrix
+ * instead, whose documented maximum for an SPI master is exactly 40 MHz. This
+ * therefore sits at the ceiling with no headroom at all: 40 is the end of the
+ * road on this pinout, and going faster would mean rewiring to the IOMUX pins
+ * first, not just editing this line.
  *
  * If the screen ever shows torn rows, snow, or wrong colours after a wiring
  * change, put this back to 10 MHz first -- long jumper wires are the usual

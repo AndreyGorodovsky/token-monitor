@@ -180,7 +180,37 @@ static esp_timer_handle_t s_reconnect_timer;
  * pointer supplied at creation time -- we don't need one, so it goes unused. */
 static void reconnect_timer_cb(void *arg)
 {
-    esp_wifi_connect();
+    esp_err_t err = esp_wifi_connect();
+    if (err == ESP_OK) {
+        return;                  /* the outcome arrives later, as an event */
+    }
+
+    /* If this is not handled here, nothing retries at all.
+     *
+     * The whole retry chain is driven by WIFI_EVENT_STA_DISCONNECTED re-arming
+     * this timer -- but that event only exists if an association was actually
+     * attempted. A synchronous failure means it was not, so no event is ever
+     * posted, no timer is ever re-armed, and the chip sits on NO WIFI until
+     * someone power-cycles it, with nothing in the log to explain why. That
+     * would quietly falsify the one promise stage 8 makes about WiFi: that it
+     * recovers unattended.
+     *
+     * So this path re-arms itself. The tally is bumped too, or a persistent
+     * failure would spin at the same short delay forever instead of backing
+     * off like every other retry. */
+    ESP_LOGW(TAG, "esp_wifi_connect() failed: %s -- retrying anyway",
+             esp_err_to_name(err));
+    s_retry_count++;
+
+    esp_timer_stop(s_reconnect_timer);
+    esp_err_t rearm = esp_timer_start_once(
+        s_reconnect_timer, (uint64_t)reconnect_delay_ms(s_retry_count) * 1000);
+    if (rearm != ESP_OK) {
+        /* Logged rather than ESP_ERROR_CHECKed: panicking inside the recovery
+         * path would be a worse outcome than the fault being recovered from. */
+        ESP_LOGE(TAG, "could not re-arm the reconnect timer: %s",
+                 esp_err_to_name(rearm));
+    }
 }
 
 /* --- event handlers ----------------------------------------------------- */
@@ -222,7 +252,20 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * is 5 GHz only -- this chip is 2.4 GHz only), 15 = 4-way handshake
          * timeout (wrong password), 2 = AUTH_EXPIRE (seen routinely at boot
          * on WPA3, and it recovers on its own), 205 = connection lost. */
-        ESP_LOGW(TAG, "disconnected (reason %d), retry %d", e->reason, ++s_retry_count);
+        /* Incremented on its own line, deliberately -- do not fold it back
+         * into the log call. ESP_LOGW expands to
+         * `if (LOG_LOCAL_LEVEL >= ESP_LOG_WARN) ...`, so a side effect in its
+         * argument list vanishes along with the log line if this build's log
+         * level is ever lowered past WARN (a normal thing to do for a quiet
+         * release build). That was harmless while the counter only fed a
+         * printed number. It stopped being harmless when reconnect_delay_ms()
+         * started reading it: the tally would sit at zero, the backoff would
+         * flatten to a fixed 2 seconds, and an absent router would be probed
+         * eighteen hundred times an hour -- the exact behaviour the backoff
+         * was added to stop, reappearing silently from a config change in a
+         * different file. */
+        s_retry_count++;
+        ESP_LOGW(TAG, "disconnected (reason %d), retry %d", e->reason, s_retry_count);
 
         /* Hand the wait to esp_timer and return immediately, so this handler
          * never blocks the event loop. See s_reconnect_timer above.
@@ -690,22 +733,65 @@ static uint16_t usage_colour(int pct)
     return COL_ALERT;
 }
 
+/* Integer square root, so the width maths below needs neither libm nor
+ * floating point on a chip that has no FPU. The inputs here never exceed
+ * 120*120, so this loops at most 120 times -- a handful of microseconds, a few
+ * times per refresh. */
+static int isqrt(int n)
+{
+    int x = 0;
+    while ((x + 1) * (x + 1) <= n) {
+        x++;
+    }
+    return x;
+}
+
 /* Horizontal centring is worth a helper because every line on this display is
  * centred -- on a round panel there is no left margin to align to. */
 static void draw_centred(int y, const char *text, uint16_t fg, int scale)
 {
     const int cell = GC9A01_CHAR_W * scale;   /* full advance per character */
 
-    /* How many characters fit across the panel at this size. Two of the
-     * strings drawn here -- the reset times -- come from the PC, and the
-     * contract allows them to be longer than English "Thu 19:00" (a
-     * non-English weekday can be several bytes per letter). Left alone,
-     * an over-long string would silently lose its leading and trailing
-     * characters: draw_text skips any glyph that would fall off the panel,
-     * so the display would show a confidently centred fragment with nothing
-     * to say it had been cut. Truncating deliberately and marking it with
-     * ">" makes that visible, which is the rule this project keeps to. */
-    int max_chars = GC9A01_WIDTH / cell;
+    /* How many characters fit *inside the circle* on this row.
+     *
+     * GC9A01_WIDTH would be the answer on a rectangular panel, and using it
+     * here was a real (if hard to reach) bug: this panel is round, so the
+     * controller addresses the full 240x240 square while the corners sit
+     * behind the bezel. The usable width depends on how far the row is from
+     * the vertical centre -- at ROW_7D_RESET only about 190 pixels are
+     * visible, so the square assumption permitted twenty characters where
+     * fifteen can be seen.
+     *
+     * Why that mattered more than it looks: the ">" marking a deliberate
+     * truncation would itself have been drawn outside the circle, so an
+     * over-long string would have lost glyphs off *both* ends with nothing on
+     * screen to say it had been cut -- which is the exact silent failure this
+     * guard exists to prevent. Reachable from network data, too: the reset
+     * times come from the PC, and the contract allows a longer non-English
+     * weekday than "Thu 19:00".
+     *
+     * The narrow row is the top of the glyph for text above centre and the
+     * bottom for text below it, so measure at whichever is further out. As a
+     * check on the arithmetic, this independently reproduces
+     * BANNER_MAX_CHARS = 12 at ROW_BANNER. */
+    const int r      = GC9A01_WIDTH / 2;
+    const int top_dy = y - r;
+    const int bot_dy = y + GC9A01_CHAR_H * scale - 1 - r;
+
+    int dy = (top_dy < 0) ? -top_dy : top_dy;
+    const int bot_abs = (bot_dy < 0) ? -bot_dy : bot_dy;
+    if (bot_abs > dy) {
+        dy = bot_abs;
+    }
+
+    const int usable = (dy >= r) ? 0 : 2 * isqrt(r * r - dy * dy);
+    int max_chars = usable / cell;
+
+    if (max_chars < 1) {
+        return;    /* this row lies entirely behind the bezel; drawing into it
+                    * would be invisible, and the truncation maths below
+                    * assumes there is room for at least one character */
+    }
 
     char clipped[32];
     if (max_chars > (int)sizeof(clipped) - 2) {
@@ -1064,6 +1150,23 @@ static void fetch_once(char *storage, int storage_cap)
     esp_err_t err = esp_http_client_perform(client);
 
     if (err != ESP_OK) {
+        /* Ask the radio again before naming a culprit.
+         *
+         * The loop checked WiFi before calling in here, but that was up to ten
+         * seconds ago -- the length of the timeout this request may have just
+         * spent. A link that dropped mid-request lands on this branch, and
+         * calling that NO LINK would send someone to debug the PC over what is
+         * actually a radio problem: exactly the misdiagnosis the NO WIFI /
+         * NO LINK split was added to prevent. */
+        if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
+            ESP_LOGW(TAG, "request failed (%s), and wifi is down -- the link "
+                          "dropped mid-request, so this is not the PC",
+                     esp_err_to_name(err));
+            show_failure("NO WIFI", "NO WIFI", "RECONNECTING");
+            esp_http_client_cleanup(client);
+            return;
+        }
+
         ESP_LOGE(TAG, "request failed: %s", esp_err_to_name(err));
         /* Stage 4 already proved this chip can resolve DNS and reach the
          * internet, and the loop below has already confirmed WiFi is up before

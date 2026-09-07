@@ -243,6 +243,53 @@ that there's real pixel budget. Land on something in the build itself rather tha
 here — the important constraint is just the stale/unreachable state below,
 which needs to stay visible in whatever layout is chosen.
 
+**As built.** Text first (stage 7), gauge arcs added afterwards — in that
+order deliberately, so the numbers were proven readable before anything
+decorative went near them.
+
+```
+         . - - - - - - - - .        5-hour arc: the rim of the top half,
+     .  '   _______________  ` .    clockwise from nine o'clock
+   '      /                 \    `
+  |          5 - H O U R          |
+  |             7 0 %             |   large, colour-banded
+  |            1 5 : 3 0          |
+  |        - - - - - - - -        |   divider, or the status banner
+  |           7 - D A Y           |
+  |             1 6 %             |
+  |          T H U  1 9 : 0 0     |
+   .      \_________________/    ,   7-day arc: the rim of the bottom half,
+     .  ,                    . '     also clockwise, from three o'clock
+         ' - - - - - - - - '
+```
+
+Three things about it are load-bearing rather than taste:
+
+- **The arcs tile the ring as two halves and never overlap.** The 5-hour
+  gauge is anchored at nine o'clock and sweeps clockwise over the top; the
+  7-day gauge is anchored at three o'clock and sweeps clockwise under the
+  bottom. Each is capped at a half turn (1.8° per percent), so at 100% and
+  100% they meet at nine and three and close the circle exactly. There is no
+  unfilled "track" behind either: an empty rim reads as zero perfectly well,
+  and a track would compete with the numbers for attention.
+- **An arc takes its colour from the same function as its number**, including
+  the flat grey of data too old to be a claim about now. An arc still green
+  beside a grey number would be the display contradicting itself.
+- **Text and ring have separate territory, and the boundary is enforced in
+  one place.** Everything that is not the ring — glyphs, the opaque
+  background behind them, and every row clear — stays inside `CONTENT_R`,
+  two pixels inside the ring's inner edge. This is not fussiness: the row
+  clears originally ran the full panel width, which quietly cut two bites out
+  of the ring on every text row that changed. It looked correct until the
+  first percentage moved, because the arcs are drawn last on a full repaint.
+
+The status banner sits in the middle, sharing a slot with the divider, and
+that is a consequence of the arcs rather than a preference — see the failure
+states above. At the bottom of a round panel there is only room for eleven
+characters, and `BAD DATA 12M` is twelve; the ring then took that space
+entirely. In the middle the circle is at its widest, and the banner
+*displacing* the divider makes it harder to overlook than adding a line would.
+
 **Failure states to show, not hide:**
 
 - WiFi not connected yet → explicit "connecting..." state, not a blank or

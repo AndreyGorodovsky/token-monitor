@@ -157,17 +157,35 @@ Six things to actually check, not just glance at:
    exactly what happened the first time stage 7 ran. Expect:
 
    ```
-           5-HOUR          dim grey label
-            63%            large, colour-banded
-           17:10           reset time
-         ──────────
-           7-DAY
-             7%
-         THU 19:00
+          . - - - - - - - .        5-hour arc, on the rim of the
+      .  '  ___________  ` .       top half
+    '      /           \    `
+   |        5 - H O U R      |     dim grey label
+   |           6 3 %         |     large, colour-banded
+   |          1 7 : 1 0      |     reset time
+   |       - - - - - - -     |     divider (or the status banner)
+   |         7 - D A Y       |
+   |            7 %          |
+   |        T H U  1 9 : 0 0 |
+    .      \___________/    ,      7-day arc, on the rim of the
+      .  ,               . '       bottom half
+          ' - - - - - - '
    ```
 
-   Colour bands are green under 50%, amber to 80%, red above. A `STALE` badge
-   appears under the second reading only when the data is not current.
+   Colour bands are green under 50%, amber to 80%, red above — and **the arc
+   uses the same colour as its own number**, so if you ever see a green arc
+   beside an amber figure, that is a bug and not a subtlety.
+
+   The arcs are gauges, not decoration: each is anchored where its half of
+   the ring begins and sweeps **clockwise**, 1.8° per percent. The 5-hour
+   starts at nine o'clock and fills over the top; the 7-day starts at three
+   o'clock and fills under the bottom. They meet at nine and three only when
+   both read 100%. There is no track behind them, so an empty rim is zero.
+
+   The **status banner shares the middle slot with the divider** — when
+   something is wrong, the hairline is replaced by text such as `NO LINK 3M`.
+   It lives there rather than at the bottom because the ring took that space;
+   see `BANNER_MAX_CHARS` in the source for the arithmetic.
 2. **The IP is on the same subnet as the PC running `pc_service`.** A
    different subnet means the chip landed on a guest network or a second AP,
    and no firewall rule will fix that.
@@ -280,6 +298,10 @@ over the last known numbers, or a `NO DATA` screen if there are none yet.
 | Panic naming a stack overflow in `usage` | The 8 KB task stack was reduced; put it back |
 | `free heap` falling a little more on every refresh | A leak on the once-a-request path — suspect a missing `esp_http_client_cleanup` or `cJSON_Delete` |
 | Screen flashes black on every refresh | The partial-redraw model is being bypassed — something is calling `gc9a01_fill_screen` or forcing a screen-mode change each cycle |
+| Arcs correct at boot, then develop gaps as numbers change | Something is drawing outside `CONTENT_R` and erasing the ring. This exact bug shipped once: the text row clears ran the full 240 px panel width, cutting both arms of the ring on every row that repainted. It looks fine until the first update, because the arcs are drawn last on a full repaint |
+| An arc is a different colour from its own number | `set_arc` and the number are being passed different colours; they should both come from `usage_colour` (or both `COL_DEAD` when the data is stale) |
+| An arc runs more than halfway round | `gc9a01_fill_arc` caps `sweep_deg` at 180 for a reason — past a half turn its two half-plane tests describe the complement of the wedge, and the arc inverts. Draw anything larger as two calls |
+| Text truncated with `>` earlier than expected | Text is fitted to `CONTENT_R`, not the panel edge, because the ring owns the rim. The display is deliberately smaller than it looks |
 | Screen frozen while the serial log keeps refreshing | Drawing happens on one task by convention, with nothing enforcing it. A second task touching `gc9a01` is the thing to look for |
 | `Failed to connect … No serial data received` while flashing | Auto-reset into download mode did not take. Hold `B`, tap `R`, release `B`, then flash |
 | Boots to `boot:0x0 (USB_BOOT)` and `wait usb download` | Still in download mode after a manual `B`+`R` flash. Tap `R` alone — do not hold `B` — to boot the app |
@@ -296,6 +318,22 @@ for as long as that was all stage 6 needed; stage 7 added rectangle fills and
 text on top of the same address-window mechanism, and stage 8 leans on
 `gc9a01_fill_rect` for the partial redraws that keep a once-a-minute refresh
 from flashing.
+
+`gc9a01_fill_arc` came last, for the gauges. It fills the wedge as a
+**region** rather than stroking it as a path, which is what makes it both
+simple and gapless — sweeping an angle and plotting points needs sub-degree
+steps at this radius (one degree is two pixels at r=118) and still leaves
+ragged ends, whereas testing each pixel of the annulus for membership has no
+step size to get wrong. The test itself is two integer cross products per
+pixel: for a sweep of at most 180°, a point is inside exactly when it is
+clockwise of the start ray and anticlockwise of the end ray. No `atan2`, no
+floating point, and trigonometry only twice per call — from a 91-entry
+fixed-point sine table — to turn the two angles into direction vectors.
+
+`gc9a01_chord_half` is the other half of drawing on a round panel: how wide a
+circle of a given radius is on a given row. The app asks it two things —
+where the visible edge is, and where the ring's inner edge is — so that
+knowledge lives in the driver rather than being re-derived by each caller.
 
 The SPI clock is **40 MHz**, raised from 10 at stage 8 once the screen was
 known-good — deliberately on its own, so that a failure would have one suspect

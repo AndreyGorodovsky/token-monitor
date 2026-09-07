@@ -17,11 +17,14 @@
  *   3. the vendor init table   -- copied, not derived; see the note above it
  *   4. gc9a01_init             -- reset, table, then standard MIPI commands
  *   5. fill_rect / fill_screen -- address window + a row buffer, h times
- *   6. text                    -- glyph lookup, then one window per character
+ *   6. round-panel geometry    -- how wide the visible circle is on a row
+ *   7. arcs                    -- the gauge ring, filled as a region
+ *   8. text                    -- glyph lookup, then one window per character
  *
  * Everything drawable is built from one idea: set an address window, then
  * stream pixels into it. A rectangle and a character differ only in how the
- * bytes are computed.
+ * bytes are computed -- and the arc is not an exception, it just works out
+ * which horizontal runs to fill before filling them.
  * ---------------------------------------------------------------------------
  */
 
@@ -185,6 +188,10 @@ static void lcd_data(const uint8_t *data, size_t len)
     lcd_transmit(data, len);
 }
 
+/* The panel's hardware reset line, with the two delays the controller
+ * requires. Neither is padding: the pulse has to be held long enough to be
+ * seen, and the panel ignores commands until it has settled afterwards.
+ * Shortening these is a classic way to get an intermittently blank screen. */
 static void lcd_reset(void)
 {
     gpio_set_level(PIN_RST, 0);
@@ -257,6 +264,9 @@ static const lcd_init_cmd_t init_cmds[] = {
     {0x99, {0x3E, 0x07}, 2},
 };
 
+/* Claims the SPI bus and registers the panel on it. Called once, from
+ * gc9a01_init; split out only so that function reads as the sequence it is
+ * (bus, reset, vendor table, MIPI commands) rather than a wall of config. */
 static void spi_init(void)
 {
     spi_bus_config_t buscfg = {
@@ -436,6 +446,182 @@ void gc9a01_fill_rect(int x, int y, int w, int h, uint16_t color565)
 void gc9a01_fill_screen(uint16_t color565)
 {
     gc9a01_fill_rect(0, 0, GC9A01_WIDTH, GC9A01_HEIGHT, color565);
+}
+
+/* --- round-panel geometry ------------------------------------------------
+ *
+ * The panel is a 240x240 square that you can only see a circle of. Both the
+ * arc below and the app's text centring need to know how wide that circle is
+ * on a given row, so the knowledge lives here, with the driver that knows the
+ * panel is round -- not re-derived by every caller.
+ */
+
+/* Integer square root: floor(sqrt(n)) for n >= 0.
+ *
+ * Written out rather than pulling in libm, because this chip has no hardware
+ * floating point -- sqrt() would drag in a software implementation for
+ * something that only ever needs whole pixels.
+ *
+ * The loop runs once per unit of the result, so its cost is the answer itself:
+ * at most about 120 iterations for the radii this panel uses, which is a few
+ * microseconds a handful of times per redraw. Fine here; not a general-purpose
+ * square root to reach for with a large n. */
+static int isqrt(int n)
+{
+    int x = 0;
+    while ((x + 1) * (x + 1) <= n) {
+        x++;
+    }
+    return x;
+}
+
+/* See gc9a01.h for what this is for. The arithmetic is just Pythagoras on the
+ * circle's equation: a row `dy` from the centre cuts a chord of half-width
+ * sqrt(r^2 - dy^2), which is 0 once |dy| reaches the radius. */
+int gc9a01_chord_half(int y, int radius)
+{
+    const int cy = GC9A01_HEIGHT / 2;
+
+    int dy = y - cy;
+    if (dy < 0) {
+        dy = -dy;
+    }
+    if (dy >= radius) {
+        return 0;                /* the circle does not reach this row */
+    }
+    return isqrt(radius * radius - dy * dy);
+}
+
+/* sin(deg) * 1024, for 0..90 degrees. Fixed point rather than float: this is
+ * only ever used to turn two angles into two direction vectors, and 1/1024
+ * resolution puts the error at the rim well under a pixel.
+ *
+ * Written out rather than generated because, unlike the font, there is nothing
+ * to check by eye here -- a wrong glyph is a design mistake, a wrong sine is
+ * arithmetic, and arithmetic is verified by the arc landing where it should. */
+static const int16_t sin1024_table[91] = {
+       0,   18,   36,   54,   71,   89,  107,  125,  143,  160,
+     178,  195,  213,  230,  248,  265,  282,  299,  316,  333,
+     350,  367,  384,  400,  416,  433,  449,  465,  481,  496,
+     512,  527,  543,  558,  573,  587,  602,  616,  630,  644,
+     658,  672,  685,  698,  711,  724,  737,  749,  761,  773,
+     784,  796,  807,  818,  828,  839,  849,  859,  868,  878,
+     887,  896,  904,  912,  920,  928,  935,  943,  949,  956,
+     962,  968,  974,  979,  984,  989,  994,  998, 1002, 1005,
+    1008, 1011, 1014, 1016, 1018, 1020, 1022, 1023, 1023, 1024,
+    1024,
+};
+
+/* sin(deg) * 1024 for ANY integer angle, by folding the quarter-turn table
+ * above into the other three quadrants.
+ *
+ * The table only stores 0..90 because the rest is that quarter reflected and
+ * negated: sin is symmetric about 90 degrees and antisymmetric about 180. So
+ * the four branches below are one per quadrant, and together they cover the
+ * whole circle from 91 stored values.
+ *
+ * The double modulo is not redundant. C's % keeps the sign of the left
+ * operand, so -30 % 360 is -30, not 330 -- adding 360 and taking it again is
+ * the standard way to get a non-negative result. Negative angles reach here
+ * routinely, because callers add a sweep to a start angle without normalising. */
+static int sin1024(int deg)
+{
+    deg = ((deg % 360) + 360) % 360;
+
+    if (deg <=  90) { return  sin1024_table[deg]; }         /* first quadrant */
+    if (deg <= 180) { return  sin1024_table[180 - deg]; }   /* reflected      */
+    if (deg <= 270) { return -sin1024_table[deg - 180]; }   /* negated        */
+    return                   -sin1024_table[360 - deg];     /* both           */
+}
+
+/* Cosine is sine a quarter turn ahead, so there is no second table. */
+static int cos1024(int deg)
+{
+    return sin1024(deg + 90);
+}
+
+/* --- arcs ----------------------------------------------------------------
+ *
+ * Filled as a *region*, not stroked as a path, and that choice is the whole
+ * reason this is simple. Sweeping an angle and plotting points along it needs
+ * sub-degree steps to avoid gaps at this radius (one degree is two pixels at
+ * r=118) and still leaves ragged ends. Testing each pixel of the annulus for
+ * membership instead cannot leave a gap, because there is no step size.
+ *
+ * The membership test is the part worth understanding. For a sweep of at most
+ * 180 degrees, a point is inside the arc exactly when it is clockwise of the
+ * start ray AND anticlockwise of the end ray. "Clockwise of" is the sign of a
+ * 2D cross product, so the whole test is two integer multiplies per pixel --
+ * no atan2, no trigonometry inside the loop. Trig is used exactly twice per
+ * call, to turn the two angles into direction vectors.
+ *
+ * That 180-degree limit is not incidental: past a half turn the two half-plane
+ * tests stop describing a wedge and start describing its complement, so the
+ * arc would invert. The cap below enforces it. This project never needs more,
+ * since the two arcs deliberately tile the circle as two halves.
+ */
+void gc9a01_fill_arc(int cx, int cy, int r_in, int r_out,
+                     int start_deg, int sweep_deg, uint16_t color565)
+{
+    if (sweep_deg <= 0 || r_out <= 0 || r_in >= r_out) {
+        return;                         /* nothing to draw, said calmly */
+    }
+    if (sweep_deg > 180) {
+        sweep_deg = 180;                /* see the note above */
+    }
+
+    /* Screen coordinates, with y increasing downward, and angles measured
+     * clockwise from twelve o'clock -- so the direction vector for an angle a
+     * is (sin a, -cos a). Scaled by 1024, like the table. */
+    const int sx =  sin1024(start_deg);
+    const int sy = -cos1024(start_deg);
+    const int ex =  sin1024(start_deg + sweep_deg);
+    const int ey = -cos1024(start_deg + sweep_deg);
+
+    const int ro2 = r_out * r_out;
+    const int ri2 = r_in  * r_in;
+
+    for (int y = cy - r_out; y <= cy + r_out; y++) {
+        if (y < 0 || y >= GC9A01_HEIGHT) {
+            continue;
+        }
+
+        const int dy  = y - cy;
+        const int dy2 = dy * dy;
+        if (dy2 > ro2) {
+            continue;
+        }
+
+        const int half = isqrt(ro2 - dy2);
+
+        /* Walk the row and emit each unbroken run as one fill_rect, rather
+         * than one call per pixel. A row of this annulus is at most two runs
+         * (the left and right arms), so a full half-ring costs a few hundred
+         * short transfers rather than several thousand single-pixel ones. */
+        int run_start = -1;
+
+        for (int x = cx - half; x <= cx + half; x++) {
+            const int dx = x - cx;
+            const int d2 = dx * dx + dy2;
+
+            /* Inside the ring, and inside the wedge. The two cross products
+             * are (start x v) and (end x v) for v = (dx, dy). */
+            const bool on = (d2 >= ri2) && (d2 <= ro2)
+                         && ((int64_t)sx * dy - (int64_t)sy * dx >= 0)
+                         && ((int64_t)ex * dy - (int64_t)ey * dx <= 0);
+
+            if (on && run_start < 0) {
+                run_start = x;
+            } else if (!on && run_start >= 0) {
+                gc9a01_fill_rect(run_start, y, x - run_start, 1, color565);
+                run_start = -1;
+            }
+        }
+
+        if (run_start >= 0) {
+            gc9a01_fill_rect(run_start, y, cx + half + 1 - run_start, 1, color565);
+        }
+    }
 }
 
 /* --- text ---------------------------------------------------------------- */

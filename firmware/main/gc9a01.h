@@ -96,6 +96,40 @@ void gc9a01_fill_screen(uint16_t color565);
  * once-a-minute refresh from visibly flashing. */
 void gc9a01_fill_rect(int x, int y, int w, int h, uint16_t color565);
 
+/* Half-width, in pixels, of a circle of `radius` centred on the panel, at row
+ * `y` -- 0 for a row the circle does not reach. The span on that row is x from
+ * (120 - this) to (120 + this).
+ *
+ * The panel is an addressable 240x240 square of which only the inscribed
+ * circle can be seen, so "how much room is there" has a different answer on
+ * every row, and the answer at the top or bottom of a glyph is the one that
+ * decides whether it is readable. Pass GC9A01_WIDTH / 2 for the visible edge.
+ *
+ * It takes a radius rather than assuming the panel's because a caller drawing
+ * a ring at the rim needs the same arithmetic for a *smaller* circle -- the
+ * one bounding the area still safe to draw text in. Doing it here keeps that
+ * knowledge in one place instead of re-derived per caller. */
+int gc9a01_chord_half(int y, int radius);
+
+/* Fills a wedge of an annulus: the region between radii `r_in` and `r_out`,
+ * from `start_deg`, sweeping `sweep_deg` degrees clockwise.
+ *
+ * Angles are measured **clockwise from twelve o'clock**, which is how you
+ * describe a gauge out loud: 0 is the top, 90 is three o'clock, 180 the
+ * bottom, 270 nine o'clock.
+ *
+ * `sweep_deg` is capped at 180. The membership test inside is two half-plane
+ * comparisons, which describe a wedge only up to a half turn -- beyond that
+ * they would describe its complement and the arc would invert. Draw a larger
+ * arc as two calls if one is ever needed.
+ *
+ * Filled as a region rather than stroked as a path, so it cannot leave gaps at
+ * any radius, and drawn in horizontal runs, so a half-ring costs a few hundred
+ * short transfers rather than thousands of single pixels. Passing the
+ * background colour erases, which is how a shrinking gauge gives space back. */
+void gc9a01_fill_arc(int cx, int cy, int r_in, int r_out,
+                     int start_deg, int sweep_deg, uint16_t color565);
+
 /* Draws text with an opaque background, top-left anchored at (x, y).
  *
  * Opaque rather than transparent on purpose: it means redrawing a changed

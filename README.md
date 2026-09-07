@@ -3,8 +3,10 @@
 An always-on desk gadget that shows current Claude subscription usage — how
 much of the 5-hour rolling window and the 7-day rolling window has been used,
 and when each one resets — on a round 1.28" colour display driven by a Seeed
-XIAO ESP32-C3. It refreshes itself over WiFi every 45 seconds; there are no
-buttons and nothing to check manually.
+XIAO ESP32-C3. Each window gets a gauge arc around the rim and a large
+colour-banded percentage, so it reads at a glance from across a desk. It
+refreshes itself over WiFi every 45 seconds; there are no buttons and nothing
+to check manually.
 
 **Status:** complete. All eight stages of the build order are written and
 verified on hardware — the chip sits on a desk, updates itself, recovers from

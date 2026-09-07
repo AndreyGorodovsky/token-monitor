@@ -23,6 +23,14 @@
  * lie by omission. A number with no indicator means it is current; that is a
  * promise, and every branch here exists to keep it.
  *
+ * Added after stage 8 landed: two gauge arcs around the rim, one per window,
+ * so the readings can be taken in at a glance without reading digits. They
+ * cost about 1.5 KB and no RAM, and they brought one layout change with them
+ * -- the status banner moved from the bottom of the screen to the middle,
+ * because the ring took the space it used to occupy. See the note above
+ * BANNER_MAX_CHARS for that story, and the one above CONTENT_R for the rule
+ * that keeps text and ring out of each other's way.
+ *
  * Success looks like: a colour cycle, "CONNECTING", then both percentages with
  * their reset times, updating quietly every 45 seconds. pc_service must be
  * RUNNING on the PC named by PC_SERVICE_HOST in secrets.h -- otherwise the
@@ -37,9 +45,10 @@
  *   4. WiFi event handlers      -- code the WiFi driver calls back into
  *   5. the JSON contract        -- stage 5: usage_t and its parser
  *   6. the screen               -- palette, layout, staleness, rendering
- *   7. the request and the loop -- stage 8: one fetch, then forever
- *   8. wifi_start()             -- one-time setup, in dependency order
- *   9. app_main()               -- the entry point; where execution begins
+ *   7. the gauge arcs           -- geometry, state, and drawing the delta
+ *   8. the request and the loop -- stage 8: one fetch, then forever
+ *   9. wifi_start()             -- one-time setup, in dependency order
+ *  10. app_main()               -- the entry point; where execution begins
  *
  * One rule that is invisible in the code: gc9a01 is not thread-safe, and
  * drawing happens from two places -- app_main (the boot messages) and
@@ -615,6 +624,28 @@ static void print_usage(const usage_t *u)
  * code, because the useful question about a round display is always "does this
  * still fit inside the circle" and that is much easier to answer from a list.
  *
+ * What it looks like, with the y of each row on the left:
+ *
+ *              . - - - - - - - - .          the 5-hour arc runs along the
+ *          .  '   _______________  ` .      rim of the top half, clockwise
+ *        '      /                 \    `    from nine o'clock
+ *   28  |          5 - H O U R          |
+ *   46  |             7 0 %             |   <- big, colour-banded
+ *   86  |            1 5 : 3 0          |
+ *  104  |        - - - - - - - -        |   <- divider, or the banner
+ *  122  |           7 - D A Y           |      when something is wrong
+ *  140  |             1 6 %             |
+ *  180  |          T H U  1 9 : 0 0     |
+ *        .      \_________________/    ,    the 7-day arc runs along the
+ *          .  ,                    . '      rim of the bottom half, also
+ *              ' - - - - - - - - '          clockwise, from three o'clock
+ *
+ * Each y is the TOP row of that line's glyphs; a line at SCALE_LABEL is 14
+ * pixels tall and one at SCALE_VALUE is 35, so ROW_5H_VALUE at 46 occupies
+ * rows 46 to 80. That matters more than it sounds: on a round panel the
+ * bottom of a glyph can fall outside the circle while its top is comfortably
+ * inside.
+ *
  * The panel is 240x240 but *round*: the controller addresses the full square
  * and the corners are simply behind the bezel. The usable half-width at a
  * given row y is sqrt(120^2 - (y-120)^2), so the top and bottom rows here are
@@ -623,25 +654,60 @@ static void print_usage(const usage_t *u)
 #define ROW_5H_LABEL   28
 #define ROW_5H_VALUE   46
 #define ROW_5H_RESET   86
-#define ROW_DIVIDER   110
+#define ROW_MIDDLE    104
 #define ROW_7D_LABEL  122
 #define ROW_7D_VALUE  140
 #define ROW_7D_RESET  180
-#define ROW_BANNER    202
+
+/* The hairline that lives in the middle slot whenever there is no banner to
+ * show. Offset to sit centred within that slot's 14-pixel band. */
+#define DIVIDER_X       60
+#define DIVIDER_W      120
+#define DIVIDER_INSET    6
+
+/* The gauge ring, and the boundary it imposes on everything else.
+ *
+ * Six pixels thick: enough to read as a gauge from across a desk, thin enough
+ * to look like an instrument rather than a pie chart. It was twelve first,
+ * which was heavy.
+ *
+ * CONTENT_R is the important one. Everything that is not the ring -- every
+ * glyph, every background fill behind a glyph, every row clear -- has to stay
+ * inside this radius, or it will erase the ring the next time it is redrawn.
+ * That is not hypothetical: the row clears were full panel width to begin
+ * with, which cut two bites out of the ring on every text row that changed,
+ * and the display only looked right until the first percentage moved. Keeping
+ * the two radii adjacent, with the reason next to them, is the cheapest
+ * defence against re-introducing it. */
+#define ARC_R_OUT      118
+#define ARC_R_IN       112
+#define CONTENT_R      (ARC_R_IN - 2)
 
 #define SCALE_LABEL  2       /* 12x14 px per character */
 #define SCALE_VALUE  5       /* 30x35 -- the number you read from across a desk */
 
 /* The banner is the one line that says whether to believe the numbers above
- * it, and it sits low on a *round* panel, where the width runs out fast. Its
- * bottom row of pixels is y = ROW_BANNER + 13 = 215, where the circle is
- * 2*sqrt(120^2 - 95^2) = 146 pixels across. Twelve characters at SCALE_LABEL
- * measure 12*12 - 2 = 142 pixels of ink, so twelve fit and thirteen do not.
+ * it, and where it sits has now been decided twice, for two different reasons.
  *
- * That is why this is 202 and not stage 7's 205: at 205 the budget is eleven
- * characters and "BAD DATA 12M" is twelve. Three pixels of headroom bought the
- * longest string this screen needs to say. BANNER_CAP is one more than the
- * budget, for the NUL, and snprintf is what enforces it. */
+ * Stage 8 put it at the bottom, at y=202 rather than 205, because the circle
+ * narrows fast down there: at 205 only eleven characters are visible and
+ * "BAD DATA 12M" is twelve, so three pixels of headroom bought the longest
+ * string this screen needs to say.
+ *
+ * The arcs then took that space away entirely. On the banner's bottom row the
+ * ring occupies x=50..61, straight through text that spans 49..191 -- and
+ * thinning it does not help, because what matters is the ring's *inner* edge:
+ * at 6 pixels it sits at x=61 and at 12 it sat at x=73, both well inside the
+ * banner either way. The ring has to be near the edge to read as a gauge and
+ * the banner has to be wide to say anything useful. Shortening the banner to
+ * fit caps it at seven characters, which loses the age, and the age is the
+ * part that earns its place.
+ *
+ * So it moved to the vertical centre, where the circle is at its widest and
+ * twelve characters clear the ring by 34 pixels on each side. It shares that
+ * slot with the divider, which is what shows when there is nothing wrong --
+ * so the banner appearing displaces something familiar, which makes it harder
+ * to miss rather than easier. */
 #define BANNER_MAX_CHARS 12
 #define BANNER_CAP       (BANNER_MAX_CHARS + 1)
 
@@ -733,19 +799,6 @@ static uint16_t usage_colour(int pct)
     return COL_ALERT;
 }
 
-/* Integer square root, so the width maths below needs neither libm nor
- * floating point on a chip that has no FPU. The inputs here never exceed
- * 120*120, so this loops at most 120 times -- a handful of microseconds, a few
- * times per refresh. */
-static int isqrt(int n)
-{
-    int x = 0;
-    while ((x + 1) * (x + 1) <= n) {
-        x++;
-    }
-    return x;
-}
-
 /* Horizontal centring is worth a helper because every line on this display is
  * centred -- on a round panel there is no left margin to align to. */
 static void draw_centred(int y, const char *text, uint16_t fg, int scale)
@@ -771,20 +824,19 @@ static void draw_centred(int y, const char *text, uint16_t fg, int scale)
      * weekday than "Thu 19:00".
      *
      * The narrow row is the top of the glyph for text above centre and the
-     * bottom for text below it, so measure at whichever is further out. As a
-     * check on the arithmetic, this independently reproduces
-     * BANNER_MAX_CHARS = 12 at ROW_BANNER. */
-    const int r      = GC9A01_WIDTH / 2;
-    const int top_dy = y - r;
-    const int bot_dy = y + GC9A01_CHAR_H * scale - 1 - r;
+     * bottom for text below it, so measure at whichever is further out -- which
+     * is what gc9a01_chord_half is asked twice for.
+     *
+     * Note the radius is CONTENT_R, not the panel edge: the gauge ring owns
+     * the rim, so as far as text is concerned the display is smaller than it
+     * looks. Sanity figures, since they drove the layout: this allows 10
+     * characters at ROW_5H_LABEL, 12 at ROW_7D_RESET, and 18 at ROW_MIDDLE
+     * where the circle is near its widest. The banner needs 12, which is why
+     * it lives in the middle -- at the old bottom row it had 11. */
+    const int top_half = gc9a01_chord_half(y, CONTENT_R);
+    const int bot_half = gc9a01_chord_half(y + GC9A01_CHAR_H * scale - 1, CONTENT_R);
+    const int usable   = 2 * ((top_half < bot_half) ? top_half : bot_half);
 
-    int dy = (top_dy < 0) ? -top_dy : top_dy;
-    const int bot_abs = (bot_dy < 0) ? -bot_dy : bot_dy;
-    if (bot_abs > dy) {
-        dy = bot_abs;
-    }
-
-    const int usable = (dy >= r) ? 0 : 2 * isqrt(r * r - dy * dy);
     int max_chars = usable / cell;
 
     if (max_chars < 1) {
@@ -852,7 +904,7 @@ typedef enum {
     SLOT_5H_RESET,
     SLOT_7D_VALUE,
     SLOT_7D_RESET,
-    SLOT_BANNER,
+    SLOT_MIDDLE,      /* the divider, or the banner when there is one */
     SLOT_COUNT
 } slot_id_t;
 
@@ -873,12 +925,77 @@ static slot_t s_slots[SLOT_COUNT] = {
     [SLOT_5H_RESET] = { .y = ROW_5H_RESET, .scale = SCALE_LABEL },
     [SLOT_7D_VALUE] = { .y = ROW_7D_VALUE, .scale = SCALE_VALUE },
     [SLOT_7D_RESET] = { .y = ROW_7D_RESET, .scale = SCALE_LABEL },
-    [SLOT_BANNER]   = { .y = ROW_BANNER,   .scale = SCALE_LABEL },
+    [SLOT_MIDDLE]   = { .y = ROW_MIDDLE,   .scale = SCALE_LABEL },
 };
+
+/* --- the two usage arcs --------------------------------------------------
+ *
+ * A ring around the rim, split into halves that tile it exactly: the 5-hour
+ * gauge is anchored at nine o'clock and sweeps clockwise over the top, the
+ * 7-day gauge is anchored at three o'clock and sweeps clockwise under the
+ * bottom. Each is capped at a half turn, so they can never run into each
+ * other -- at 100% and 100% they meet at nine and three and close the circle.
+ *
+ * The arc takes its colour from the same usage_colour() the number does, so
+ * the two can never disagree about how alarming a reading is. There is no
+ * unfilled "track" behind the arc: an empty rim reads as zero perfectly well,
+ * and a track would compete with the numbers for attention.
+ *
+ * Like the text slots, these remember what is drawn -- but the redraw is
+ * cheaper still, because an arc only ever grows or shrinks. A tick from 70% to
+ * 71% paints the 1.8-degree wedge between them and touches nothing else. Only
+ * a colour-band crossing costs a full repaint. */
+#define ARC_CX        (GC9A01_WIDTH  / 2)
+#define ARC_CY        (GC9A01_HEIGHT / 2)
+#define ARC_5H_START  270    /* nine o'clock  */
+#define ARC_7D_START   90    /* three o'clock */
+
+typedef enum { ARC_5H, ARC_7D, ARC_COUNT } arc_id_t;
+
+typedef struct {
+    int      start_deg;
+    int      pct;        /* what is on the panel now; -1 = nothing drawn yet */
+    uint16_t fg;
+} arc_t;
+
+static arc_t s_arcs[ARC_COUNT] = {
+    [ARC_5H] = { .start_deg = ARC_5H_START, .pct = -1 },
+    [ARC_7D] = { .start_deg = ARC_7D_START, .pct = -1 },
+};
+
+/* 1.8 degrees per percent, rounded, so 100% is exactly a half turn. */
+static int arc_sweep(int pct)
+{
+    if (pct < 0)   { pct = 0; }
+    if (pct > 100) { pct = 100; }
+    return (180 * pct + 50) / 100;
+}
 
 static screen_mode_t s_mode = SCREEN_NOTHING;
 static char s_msg1[24];    /* the message screen's two lines, remembered for  */
 static char s_msg2[24];    /* the same reason: don't repaint an unchanged one */
+
+/* Clear one text row band -- but only the part inside the gauge ring.
+ *
+ * This began as a single full-width fill_rect, and that was the bug behind the
+ * first arc build: the ring is an annulus at the rim, so a 240-pixel clear
+ * cuts through both of its arms on every row it covers. It looked correct
+ * until it wasn't, because the arcs are drawn last on a full repaint -- so the
+ * first frame was perfect and the first percentage change bit two chunks out
+ * of the ring, one per arm, which the delta-wedge redraw never repairs.
+ *
+ * Clearing row by row out to CONTENT_R costs one short transfer per row rather
+ * than one per band. That is more calls, and still nothing: a 35-pixel band is
+ * 35 transfers of about 200 pixels, well under a millisecond in total. */
+static void clear_band(int y, int h)
+{
+    for (int row = y; row < y + h; row++) {
+        const int half = gc9a01_chord_half(row, CONTENT_R);
+        if (half > 0) {
+            gc9a01_fill_rect(GC9A01_WIDTH / 2 - half, row, 2 * half, 1, COL_BG);
+        }
+    }
+}
 
 /* Draw one line, but only if it is not already there.
  *
@@ -893,7 +1010,7 @@ static void set_slot(slot_id_t id, const char *text, uint16_t fg)
         return;
     }
 
-    gc9a01_fill_rect(0, s->y, GC9A01_WIDTH, GC9A01_CHAR_H * s->scale, COL_BG);
+    clear_band(s->y, GC9A01_CHAR_H * s->scale);
     if (text[0] != '\0') {
         draw_centred(s->y, text, fg, s->scale);
     }
@@ -902,15 +1019,96 @@ static void set_slot(slot_id_t id, const char *text, uint16_t fg)
     s->fg = fg;
 }
 
-/* Forget everything, so the next set_slot on each row draws unconditionally.
- * Must follow every full-screen fill: the panel is black again, and if the
- * model still claims otherwise, every row it believes unchanged stays blank. */
-static void forget_slots(void)
+/* Forget everything drawn, so the next update paints unconditionally. Must
+ * follow every full-screen fill: the panel is black again, and if the model
+ * still claims otherwise, everything it believes unchanged stays blank.
+ *
+ * The arcs reset to -1 rather than 0, because those mean different things: 0%
+ * is a real reading that happens to draw nothing, while -1 means "nothing has
+ * been drawn at all", which is what lets the next update skip its erase pass. */
+static void forget_drawn(void)
 {
     for (int i = 0; i < SLOT_COUNT; i++) {
         s_slots[i].text[0] = '\0';
         s_slots[i].fg = COL_BG;
     }
+    for (int i = 0; i < ARC_COUNT; i++) {
+        s_arcs[i].pct = -1;
+        s_arcs[i].fg  = COL_BG;
+    }
+}
+
+/* Bring one arc to `pct`, drawing as little as possible.
+ *
+ * Three cases, and the middle two are why this is cheap. Growing paints only
+ * the wedge between the old angle and the new; shrinking paints that same
+ * wedge in the background colour, which erases it. Only a change of colour
+ * needs the whole half-ring repainted, and that happens twice over the life of
+ * a reading, at the 50% and 80% band edges. */
+static void set_arc(arc_id_t id, int pct, uint16_t fg)
+{
+    arc_t *a = &s_arcs[id];
+
+    if (a->pct == pct && a->fg == fg) {
+        return;
+    }
+
+    const int old_sweep = (a->pct < 0) ? 0 : arc_sweep(a->pct);
+    const int new_sweep = arc_sweep(pct);
+
+    if (a->pct < 0) {
+        /* First paint after a full-screen clear: the rim is already black, so
+         * there is nothing to erase first. */
+        gc9a01_fill_arc(ARC_CX, ARC_CY, ARC_R_IN, ARC_R_OUT,
+                        a->start_deg, new_sweep, fg);
+
+    } else if (a->fg != fg) {
+        /* A band crossing recolours everything already drawn, so the old arc
+         * has to go first. Erasing the full half turn rather than just the old
+         * sweep costs the same and cannot leave a fragment behind if the two
+         * ever disagree. */
+        gc9a01_fill_arc(ARC_CX, ARC_CY, ARC_R_IN, ARC_R_OUT,
+                        a->start_deg, 180, COL_BG);
+        gc9a01_fill_arc(ARC_CX, ARC_CY, ARC_R_IN, ARC_R_OUT,
+                        a->start_deg, new_sweep, fg);
+
+    } else if (new_sweep > old_sweep) {
+        gc9a01_fill_arc(ARC_CX, ARC_CY, ARC_R_IN, ARC_R_OUT,
+                        a->start_deg + old_sweep, new_sweep - old_sweep, fg);
+
+    } else if (new_sweep < old_sweep) {
+        gc9a01_fill_arc(ARC_CX, ARC_CY, ARC_R_IN, ARC_R_OUT,
+                        a->start_deg + new_sweep, old_sweep - new_sweep, COL_BG);
+    }
+
+    a->pct = pct;
+    a->fg  = fg;
+}
+
+/* The middle band holds one of two things, so it gets its own setter rather
+ * than going through set_slot: an empty banner is not an empty row here, it is
+ * the divider. Keeping both in one slot is what makes the banner *displace*
+ * something familiar rather than merely appear somewhere, which is harder to
+ * overlook. */
+static void set_middle(const char *text, uint16_t fg)
+{
+    slot_t *s = &s_slots[SLOT_MIDDLE];
+
+    if (s->fg == fg && strcmp(s->text, text) == 0) {
+        return;
+    }
+
+    clear_band(s->y, GC9A01_CHAR_H * s->scale);
+    if (text[0] != '\0') {
+        draw_centred(s->y, text, fg, s->scale);
+    } else {
+        /* A hairline, not a box. It separates the two readings without
+         * competing with them for attention. */
+        gc9a01_fill_rect(DIVIDER_X, s->y + DIVIDER_INSET, DIVIDER_W, 2, COL_LABEL);
+    }
+
+    snprintf(s->text, sizeof(s->text), "%s", text);
+    s->fg = fg;
 }
 
 /* Compact enough for the banner's twelve characters, and never more than three
@@ -994,7 +1192,7 @@ static void render_message(const char *line1, const char *line2)
     snprintf(s_msg1, sizeof(s_msg1), "%s", line1);
     snprintf(s_msg2, sizeof(s_msg2), "%s", line2);
     s_mode = SCREEN_MESSAGE;
-    forget_slots();
+    forget_drawn();
 }
 
 /* The actual point of the whole project: usage_t, on the glass.
@@ -1012,12 +1210,9 @@ static void render_usage(const usage_t *u, const char *reason, int64_t age_s)
      * what makes a refresh cost nothing when nothing has changed. */
     if (s_mode != SCREEN_USAGE) {
         gc9a01_fill_screen(COL_BG);
-        forget_slots();
+        forget_drawn();
         draw_centred(ROW_5H_LABEL, "5-HOUR", COL_LABEL, SCALE_LABEL);
         draw_centred(ROW_7D_LABEL, "7-DAY",  COL_LABEL, SCALE_LABEL);
-        /* A hairline, not a box. It separates the two readings without
-         * competing with them for attention. */
-        gc9a01_fill_rect(60, ROW_DIVIDER, 120, 2, COL_LABEL);
         s_mode = SCREEN_USAGE;
         s_msg1[0] = '\0';
         s_msg2[0] = '\0';
@@ -1046,7 +1241,16 @@ static void render_usage(const usage_t *u, const char *reason, int64_t age_s)
 
     char banner[BANNER_CAP];
     uint16_t fg = build_banner(u, reason, age_s, banner, sizeof(banner));
-    set_slot(SLOT_BANNER, banner, fg);
+    set_middle(banner, fg);
+
+    /* The gauges last, so that if a redraw is ever interrupted the numbers are
+     * already right -- they are the reading, and the arcs are the illustration
+     * of it. Same colour as the number they belong to, including the flat grey
+     * once the data is too old to be a claim about now: an arc that stayed
+     * green while its number went grey would be the display contradicting
+     * itself. */
+    set_arc(ARC_5H, u->five_pct,  dead ? COL_DEAD : usage_colour(u->five_pct));
+    set_arc(ARC_7D, u->seven_pct, dead ? COL_DEAD : usage_colour(u->seven_pct));
 }
 
 /* --- stage 8: the two ways the screen gets updated ------------------------ */
@@ -1329,6 +1533,13 @@ static void usage_task(void *arg)
 
 /* --- setup -------------------------------------------------------------- */
 
+/* Brings the radio up: NVS, the TCP/IP stack, the event loop, then the WiFi
+ * driver itself, in that order because each depends on the one before.
+ *
+ * This only *starts* the process. It returns as soon as the driver is running,
+ * long before there is a connection -- association and the DHCP lease arrive
+ * later, on the event handlers above. Nothing here blocks waiting for a
+ * network. */
 static void wifi_start(void)
 {
     /* Four layers, bottom up. Each has to exist before the next one can:

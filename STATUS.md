@@ -6,7 +6,8 @@ design) to resume cold.
 
 **One-line status:** **complete.** All eight stages done and verified on
 hardware. The chip refreshes itself every 45s, recovers from a dropped network
-unattended, and degrades visibly when it cannot get fresh numbers.
+unattended, and degrades visibly when it cannot get fresh numbers. Two gauge
+arcs around the rim were added afterwards — see "The gauge arcs" below.
 
 ## Done and verified
 
@@ -21,6 +22,7 @@ unattended, and degrades visibly when it cannot get fresh numbers.
 | 6 — display inside `firmware/` | **done** — red/green/blue cycle correct on the panel, alongside a running WiFi radio |
 | 7 — real values on the screen | **done** — both readings, reset times and colour bands legible on the panel |
 | 8 — polish | **done** — 45s refresh, backoff + reconnect, graded staleness and failure banners, all exercised on hardware |
+| gauge arcs (post-stage-8) | **done** — one per window around the rim, 1,568 bytes, no RAM; forced the banner to the middle and exposed a full-width-clear bug |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
 `service.py` (poll + cache + `GET /usage`). Pure stdlib, no venv.
@@ -479,8 +481,17 @@ purely by the chip's own `now_epoch - updated_epoch` arithmetic, with the
 service making no claim of staleness at all. The two signals really are
 independent, and the age half works on its own.
 
-**All six visual checks are now done.** Nothing on the display's behaviour
-rests on inference any more.
+**All six visual checks are now done.** Nothing on stage 8's display
+behaviour rests on inference.
+
+The gauge arcs added later are a separate matter and are verified only in
+part — see their own section below. Confirmed on the panel: the first paint,
+the 6-pixel thickness, and both arcs in the right halves with the right
+colours. Confirmed after the full-width-clear fix: that an update no longer
+breaks the ring. **Not yet seen: the shrink path** — every observation so far
+has been of a rising percentage, so erasing a wedge back to background is
+exercised by code review and not by eye. The 5-hour window falling as earlier
+spend ages out of it is the natural way to catch it.
 
 ### New tool: `pc_service/tools/stub_stale.py`
 
@@ -610,6 +621,110 @@ changes rather than only against identical payloads. The reworked stub was
 confirmed serving a 2400s age with `stale: true`, and confirmed refusing to
 start beside the running service.
 
+## The gauge arcs (after stage 8)
+
+Requested from a photo of the working display with two arcs drawn on it in
+marker: one per window, following the rim, top half for the 5-hour and bottom
+half for the 7-day. The question asked was whether there was room for it.
+
+There was, easily, and the honest answer was that space was never the
+constraint. This is the procedural option from the deferred face analysis,
+costed there at roughly zero: **1,568 bytes of flash and no RAM at all**,
+against ~70 KB free. What it actually cost was a layout change and one real
+bug.
+
+### Geometry, as specified
+
+Both arcs sweep **clockwise**, each anchored where its half of the ring
+begins: the 5-hour at nine o'clock filling over the top, the 7-day at three
+o'clock filling under the bottom. Each is capped at a half turn — 1.8° per
+percent — so they tile the ring exactly and can never overlap. At 100% and
+100% they meet at nine and three and close the circle.
+
+No unfilled track behind either arc: an empty rim reads as zero perfectly
+well, and a track would compete with the numbers. Each arc takes its colour
+from the same `usage_colour()` its number does, including the flat grey of
+data too old to be a claim about now — an arc still green beside a grey number
+would be the display contradicting itself.
+
+Six pixels thick, radii 112–118. It was twelve first, which read as a pie
+chart rather than an instrument.
+
+### Filled as a region, not stroked as a path
+
+The implementation choice worth keeping. Sweeping an angle and plotting points
+along it needs sub-degree steps to avoid gaps at this radius — one degree is
+two pixels at r=118 — and still leaves ragged ends where the arc stops.
+
+Testing each pixel of the annulus for membership instead cannot leave a gap,
+because there is no step size to get wrong. And the test is cheap: for a sweep
+of at most 180°, a point is inside the wedge exactly when it is **clockwise of
+the start ray and anticlockwise of the end ray**, and "clockwise of" is the
+sign of a 2D cross product. So it is two integer multiplies per pixel — no
+`atan2`, no floating point, and trigonometry used exactly twice per call to
+turn the two angles into direction vectors. Pixels are emitted as horizontal
+runs, so a half-ring is a few hundred short transfers rather than thousands of
+single-pixel ones.
+
+The 180° cap is not incidental and is enforced in the driver: past a half turn
+the two half-plane tests describe the *complement* of the wedge, and the arc
+inverts. Anything larger has to be two calls.
+
+Trig comes from a 91-entry fixed-point sine table (sin × 1024, 0–90°), with
+quadrants handled by sign. Unlike the font, it is written out rather than
+generated: a wrong glyph is a design mistake you catch by eye, a wrong sine is
+arithmetic you catch by the arc landing in the wrong place.
+
+### The banner had to move
+
+The arcs took the space it was in. At the bottom of a round panel the circle
+has narrowed to 140 px on the banner's last row, and the ring reaches x=50–61
+there — straight through text spanning 49–191. Thinning the ring does not
+escape it, because what matters is the ring's *inner* edge: at 6 px it sits at
+x=61, at the original 12 px it sat at x=73, and both are well inside the
+banner. The ring must be near the edge to read as a gauge and the banner must
+be wide to say anything useful. Shortening the banner to
+clear it caps it at **seven characters**, which loses the age, and the age is
+the part that earns its place.
+
+So the banner moved to the vertical centre, where the circle is widest and
+twelve characters clear the ring by 34 px each side, and it now **shares a
+slot with the divider**: hairline when the data is fine, banner text when it
+is not. That turned out better than the original, not merely acceptable — the
+banner now *displaces* something familiar rather than appearing below
+everything, which is harder to overlook.
+
+### The one real bug: the arcs were correct until the first update
+
+Reported from the panel: right after a reboot it rendered correctly, then
+developed gaps. That symptom names the cause almost by itself — **correct on
+first paint, wrong on first update** points at the incremental path.
+
+`set_slot` cleared its row band with a full-width `fill_rect`, all 240 px.
+The ring is an annulus at the rim, so that clear cuts through **both** of its
+arms on every row it covers. On a full repaint the arcs are drawn last, so
+nothing has cut them yet and the first frame is perfect. On an update, one
+text row repaints, takes two bites out of the ring, and the delta-wedge redraw
+never repairs them — it only ever paints the newly-swept degrees. The tall
+`85%` band alone is 35 px, which was the large break in the photo.
+
+The fix is that the clear should never have been full width. Row clears now
+stop at `CONTENT_R`, two pixels inside the ring, and text is fitted to the same
+radius — so as far as anything but the ring is concerned, the display is
+smaller than it looks. Thinning the arc to 6 px helped rather than cost:
+`5-HOUR` now gets 10 characters of room where it had 8.
+
+Two things worth generalising from it:
+
+- **A full-screen repaint hides ordering bugs that an incremental one
+  exposes.** Everything was drawn in the right order on the path that redraws
+  everything; only the partial path could reveal that two subsystems disagreed
+  about who owns which pixels.
+- **Radii that are only correct relative to each other belong next to each
+  other.** `ARC_R_IN` and `CONTENT_R` are now adjacent in the source with the
+  reason written between them, because the failure mode is someone widening a
+  clear later and reintroducing exactly this.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -694,6 +809,17 @@ start beside the running service.
   moved from y=205 to y=202 at stage 8 for exactly three pixels of headroom:
   at 205 the budget is eleven characters and `"BAD DATA 12M"` is twelve.
   `BANNER_MAX_CHARS` records the budget so it does not have to be rediscovered.
+- **Text on this panel is fitted to `CONTENT_R`, not the panel edge.** The
+  gauge ring owns the rim, so anything that is not the ring — glyphs, the
+  opaque background behind them, and every row clear — must stay inside that
+  radius. Widening a clear back to the full 240 px reintroduces the bug that
+  ate the arcs. `ARC_R_IN` and `CONTENT_R` are deliberately adjacent in the
+  source because they are only correct relative to each other.
+- **`gc9a01_fill_arc` caps its sweep at 180°, and that is load-bearing.** Its
+  membership test is two half-plane comparisons, which describe a wedge only
+  up to a half turn; past that they describe its complement and the arc
+  inverts. Anything larger has to be drawn as two calls. The two gauges are
+  half-turns by design, so this never binds in practice.
 - **Watch out for more than one ESP-IDF install on the same machine.** This
   build has been developed against ESP-IDF **v5.3.5**, pinned locally through
   the VS Code extension's `idf.currentSetup` setting (`firmware/.vscode/` is
@@ -919,15 +1045,18 @@ degrades visibly rather than silently when the service or the network drops.
 
 So there is no next stage — only candidates, none of them required:
 
+- **Watch the 5-hour percentage fall, and check the arc shrinks cleanly.**
+  The only part of the arc code never exercised by eye: every change observed
+  so far has been upward. It costs nothing but patience, since the window rolls
+  on its own.
 - **The expressive face.** Deferred since stage 6 with the condition "revisit
   once the display works and the real free-flash number is known". Both are now
-  true: the display works, and the app partition has **about 70 KB free** after
-  stage 8 (`0x119a0`, 7% of the partition). The analysis in the deferred list
-  below still stands, and the note there about designing it *together with* the
-  fallback state is now the more interesting half — stage 8 built those
-  fallbacks as text banners, and a distinctive "asleep" face would be a
-  stronger visible degrade than a word. Doing it means revisiting the layout,
-  not adding to it.
+  true: the display works, and about **68 KB** remains (`0x110b0`, 7% of the
+  partition). But the arcs have since answered most of what made the idea
+  attractive — a continuous quantity carrying precision while colour carries
+  the band is now built and working — so what is left to decide is whether an
+  expressive character adds anything on top. Worth answering before building.
+  See the deferred list below.
 - **A DHCP reservation for the PC**, so `PC_SERVICE_HOST` in `secrets.h` stops
   being a thing that can silently rot. This is a router change, not a code one,
   and it is the single most likely cause of a mystery failure weeks from now.
@@ -1008,10 +1137,10 @@ So there is no next stage — only candidates, none of them required:
 
   Constraint that drives the choice: **a single 240x240 RGB565 frame is
   115,200 bytes**, and free space shrank as stages landed — about 103 KB after
-  stage 5, about 74 KB after stage 6, and **about 70 KB now that stage 8 has
-  landed** (`0x119a0`, 7% of the app partition). So one full-screen stored
-  frame does not fit at all, and literal GIF playback is out unless the
-  partition table changes. A GIF
+  stage 5, about 74 KB after stage 6, about 70 KB after stage 8, and **about
+  68 KB now that the gauge arcs have landed** (`0x110b0`, 7% of the app
+  partition). So one full-screen stored frame does not fit at all, and literal
+  GIF playback is out unless the partition table changes. A GIF
   *decoder* would be the wrong tool regardless: the assets are fixed at
   build time, so shipping an LZW decoder to unpack something that could
   have been pre-converted is pure overhead.
@@ -1031,6 +1160,19 @@ So there is no next stage — only candidates, none of them required:
   friends), deliberately, so that stage stayed verifiable against the brief
   rather than mixing a redesign into it. That makes the face a layout revision
   rather than an addition, and the banners are the thing it would replace.
+
+  **The gauge arcs have since taken part of this idea's ground, and settled
+  its main open question.** "Colour can carry the coarse band while a
+  continuous quantity carries the precision" is now built and working — that
+  is exactly what the arcs do, and they do it without a face. So what is left
+  of the face proposal is the *expressive* part only: whether a character
+  reading the worse of the two windows adds anything the arcs and colour bands
+  do not already say. Worth answering honestly before building it, because the
+  arcs have made the glanceability argument on their own.
+
+  The procedural route the analysis recommended is also no longer theoretical.
+  `gc9a01_fill_arc` and the fixed-point sine table exist, cost 1.5 KB
+  together, and would be most of what a procedural face needs.
 
 ## Housekeeping
 

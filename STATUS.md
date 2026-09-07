@@ -447,6 +447,19 @@ only practical way to exercise this on demand: across most polls the served
 numbers are byte-identical (see the 120s note in the deferred list), so the
 interesting path never runs by itself.
 
+**The boot colour cycle was confirmed by eye in the same session**, and the
+pairing is the point. Neither observation is sufficient alone: the colour cycle
+proves the BGR bit -- red, green and blue arrive as red, green and blue -- but
+a solid fill is symmetric and therefore blind to orientation, which is exactly
+how the mirroring survived to stage 7. The digits prove orientation (a mirrored
+"66" does not read as a number) but say little about colour fidelity. Together
+they cover both halves of `madctl = 0x48` with tests actually capable of
+exposing a fault in each.
+
+That leaves one item on the visual list unseen: the failure banners on the
+glass. Every one of them has been exercised through the serial log and the
+stubs, so what is unconfirmed is the rendering, not the logic.
+
 ### New tool: `pc_service/tools/stub_stale.py`
 
 A companion to the existing `stub_503.py`, and for the same reason: the

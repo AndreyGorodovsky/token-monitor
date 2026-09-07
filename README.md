@@ -3,12 +3,13 @@
 An always-on desk gadget that shows current Claude subscription usage — how
 much of the 5-hour rolling window and the 7-day rolling window has been used,
 and when each one resets — on a round 1.28" colour display driven by a Seeed
-XIAO ESP32-C3. It refreshes itself over WiFi every minute; there are no
+XIAO ESP32-C3. It refreshes itself over WiFi every 45 seconds; there are no
 buttons and nothing to check manually.
 
-**Status:** the PC-side service is finished and running; the firmware is at
-stage 3 of 8 (WiFi verified on hardware). Display rendering is next. See
-[`STATUS.md`](STATUS.md) for the detailed log.
+**Status:** complete. All eight stages of the build order are written and
+verified on hardware — the chip sits on a desk, updates itself, recovers from
+a dropped network on its own, and says so on the screen when it cannot get
+fresh numbers. See [`STATUS.md`](STATUS.md) for the detailed build log.
 
 ## How it works
 
@@ -26,11 +27,16 @@ the design keeps it on the PC and never lets it near the network:
                     else
 ```
 
-`pc_service` polls Anthropic once a minute, caches the last good result, and
-re-serves a trimmed JSON summary — percentages and reset times only — to the
-local network. The chip polls that, parses it, and draws it. If either hop
-fails, the chip keeps showing the last known numbers, visibly marked stale,
-rather than freezing on a number that looks current.
+`pc_service` polls Anthropic every two minutes, caches the last good result,
+and re-serves a trimmed JSON summary — percentages and reset times only — to
+the local network. The chip polls that every 45 seconds, parses it, and draws
+it.
+
+If either hop fails, the chip keeps showing the last known numbers with a
+banner giving their real age, rather than freezing on a number that looks
+current. Past half an hour old the numbers lose their colour entirely: they
+are still the last thing known to be true, but they have stopped being a claim
+about now, and the display should not be able to imply otherwise.
 
 ## Repository layout
 
@@ -46,15 +52,20 @@ token-monitor/
 ├── pc_service/             the PC side — Python 3.9+, standard library only
 │   ├── README.md           running it, firewall setup, troubleshooting
 │   ├── fetch_usage.py      reads the token, makes one call, prints the result
-│   └── service.py          polls on a timer, caches, serves GET /usage
+│   ├── service.py          polls on a timer, caches, serves GET /usage
+│   └── tools/              throwaway stand-ins that exercise the firmware's
+│                           failure branches on demand
 │
 └── firmware/               the chip side — ESP-IDF project, target esp32c3
     ├── README.md           build, flash, and what a good serial log looks like
     ├── CMakeLists.txt
     ├── sdkconfig.defaults  checked-in build config (4 MB flash, etc.)
+    ├── tools/make_font.py  generates the font header from ASCII art
     └── main/
         ├── CMakeLists.txt
         ├── token_monitor.c the firmware itself
+        ├── gc9a01.c/.h     hand-rolled driver for the round display
+        ├── font5x7.h       generated — do not edit by hand
         └── secrets.h.example  template — copy to secrets.h and fill in
 ```
 

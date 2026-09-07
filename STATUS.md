@@ -4,9 +4,9 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** stages 1-7 done and verified on hardware; stage 8
-(periodic refresh, reconnect handling, considered failure states) is next —
-and is the last one.
+**One-line status:** **complete.** All eight stages done and verified on
+hardware. The chip refreshes itself every 45s, recovers from a dropped network
+unattended, and degrades visibly when it cannot get fresh numbers.
 
 ## Done and verified
 
@@ -20,7 +20,7 @@ and is the last one.
 | 5 — talk to the real `pc_service` | **done** — 200, parsed, values match what the PC serves field for field |
 | 6 — display inside `firmware/` | **done** — red/green/blue cycle correct on the panel, alongside a running WiFi radio |
 | 7 — real values on the screen | **done** — both readings, reset times and colour bands legible on the panel |
-| 8 | not started |
+| 8 — polish | **done** — 45s refresh, backoff + reconnect, graded staleness and failure banners, all exercised on hardware |
 
 `pc_service/` is complete: `fetch_usage.py` (one-shot check) and
 `service.py` (poll + cache + `GET /usage`). Pure stdlib, no venv.
@@ -296,6 +296,155 @@ invalidated*, not in the change. Editing one copy of a claim and missing the
 other two is the recurring failure mode in this repo, and it is what a review
 catches cheaply.
 
+## Stage 8 as built
+
+The last stage. Stage 7 drew once, at boot; stage 8 is what turns that into
+something you can leave on a desk. Three things, per `CLAUDE.md`'s definition
+of done, plus one change that only became reachable now.
+
+**A refresh loop, at 45s.** `usage_fetch_task` (one-shot, deleted itself)
+became `usage_task` (runs forever). The three traps flagged before starting
+were all real and all avoided: the body accumulator is a local inside
+`fetch_once`, so `len`/`truncated` cannot survive into the next iteration;
+`esp_http_client_cleanup` still runs on every path; and drawing is still
+confined to one task.
+
+**WiFi reconnect that reaches the screen.** The retry timer already retried
+forever without blocking the event loop — that part needed nothing. What was
+missing is that a disconnect was invisible on the glass. Now the loop checks
+`WIFI_CONNECTED_BIT` before spending a ten-second HTTP timeout discovering
+what the radio already knows, and shows `NO WIFI` rather than `NO LINK` —
+which matters, because those two send you to debug different machines.
+
+Retries now back off: 2s for the first three, then 5s, then 30s, reset on
+success. The first three stay fast deliberately — the observed boot pattern is
+up to three `reason 2` retries before associating, and backing off early would
+turn a normal 20-second boot into a minute.
+
+`s_ever_connected` separates "has not associated yet" from "was connected and
+lost it". They look identical to the radio, but showing `NO WIFI` during every
+ordinary boot would make a working gadget look broken for its first twenty
+seconds, so the first case says `CONNECTING`.
+
+**Failure states that degrade instead of blanking.** This is the biggest
+behavioural change, and it reverses what stage 7 did. Stage 7 replaced the
+whole screen with `NO LINK` on any failure; `ARCHITECTURE.md` asks for the
+opposite — keep the last known values, visibly marked. An old number under a
+banner saying how old it is stays useful; a screen reading only `NO LINK` has
+thrown away the last thing it knew. The words-only screens now appear only
+when nothing has ever been fetched.
+
+**Staleness became a decision rather than a printed number.** Graded in three
+steps: no banner under 10 minutes, an amber banner with the real age from 10
+to 30, and past 30 the numbers themselves go flat grey. The grey-out is the
+part worth keeping — a badge says "this might be old", removing the colour
+says "this is not a statement about now", and it stops a red 94% alarming
+someone about a number that stopped being true an hour ago.
+
+The thresholds are derived, not picked round, and the derivation is the
+interesting part. `pc_service` backs off 120s → 240s → 480s → capped 900s on
+an upstream 429, so *one* 429 delays the next successful poll to t=360s and
+two in a row to t=840s. Data can therefore reach 6 and 14 minutes old with
+nothing whatsoever wrong. The first thresholds proposed for this stage were 5
+and 15 minutes, which would have fired on both — the same cry-wolf failure
+that pushed the poll interval from 60s to 120s at stage 6. Working the backoff
+through *before* writing the code is what caught it.
+
+Note also which half of the age computation does the work during an outage.
+`now_epoch - updated_epoch` needs no clock on the chip, but it freezes the
+moment the service stops answering — no new `now_epoch` arrives, so a dead PC
+would look eternally fresh. Adding `esp_timer` elapsed-since-fetch is what
+keeps the age honest, and it is the only reason the banner can count upward
+while the link is down.
+
+**No more full-screen repaints.** Repainting 240x240 every 45 seconds is a
+black flash you cannot help watching, and it happens whether or not a digit
+changed. The firmware now keeps a model of what it last drew (`s_slots`) and
+touches only rows that differ; in steady state a refresh writes zero pixels.
+Rows rather than glyphs, because every line is centred — a shorter string
+starts further right and would strand the tail of the previous one unless the
+whole row band is cleared first.
+
+**SPI clock raised 10 MHz → 40 MHz**, in its own commit. The comment on
+`SPI_CLOCK_HZ` had said since stage 6 to do exactly this: later, on its own,
+with the screen already working, so a failure would have one suspect. It works
+at 40 with no visible artefacts on this wiring.
+
+### Layout change: the banner row moved from y=205 to y=202
+
+Small, but it is the kind of thing that is invisible until it bites. The
+banner is the one line that says whether to believe the numbers above it, and
+it sits low on a *round* panel where width runs out fast. At y=205 the bottom
+row of pixels falls where the circle is 135px wide — eleven characters at
+scale 2. `"BAD DATA 12M"` is twelve. Three pixels of headroom (y=202 puts the
+bottom row where the circle is 146px) bought the longest string the screen
+needs to say, and `BANNER_MAX_CHARS` now records the budget rather than
+leaving it to be rediscovered.
+
+Worth noting the general shape: on a round display, "does it fit" has a
+different answer at every row, and the answer at the *bottom* of a glyph is
+the one that matters.
+
+### Verified on hardware
+
+Four runs, all against the real chip and real `pc_service`.
+
+**Steady state, 150s.** Fetches at t=23s, 68s, 113s — 45 seconds apart to the
+second. Free heap 191868 → 191884 → 191884 bytes: flat, which is the number
+that matters now that this code runs forever. The 7-day reading changed 10% →
+11% mid-run, so the partial-redraw path was exercised on a real change rather
+than only on unchanged data.
+
+**Reconnect backoff.** Two `reason 2` disconnects at boot, both logged
+`retrying in 2000 ms` (retries 1 and 2, inside the fast band), associated at
+t=22.3s. Behaves as before, which was the intent — the backoff only changes
+the slow cases.
+
+**Service outage and recovery, 185s.** Good fetch at t=4.9s (age 111s), then
+`pc_service` stopped. Failures at t=60s and t=115s, both
+`ESP_ERR_HTTP_CONNECT`, both keeping the numbers and raising the banner.
+Service restarted; recovered at t=160s with fresh data (5h 17% → 19%) and the
+banner cleared on its own. Heap across the whole run: 191996 → 192556 →
+192552 → 192224. No leak on the failure path either.
+
+One timing detail worth writing down: a failing cycle takes **55 seconds, not
+45** — the interval is measured from the end of the previous attempt, and a
+connection to a dead port burns the full 10-second timeout first. That is the
+intended pacing (it spaces retries out rather than bunching them), but it does
+mean the banner's age counts up in ~55s steps during an outage.
+
+**Both staleness tiers, 235s**, using the new `stub_stale.py`. Three fetches
+at a declared age of 900s (badge tier: amber banner, numbers keep their
+colours), then two at 2400s (dead tier: red banner, numbers grey). Heap stable
+across all five. This is the branch that would otherwise take half an hour of
+waiting to reach honestly, which is exactly why the stub exists.
+
+**What none of the above can prove** is what is actually on the glass. SPI
+writes are unacknowledged, so every log line here prints identically into a
+panel that is unplugged — and identically into one drawing everything
+mirrored, which is precisely how stage 7's bug survived six stages. The visual
+check is a human one, and it is the only check in this stage that a machine
+cannot make.
+
+### New tool: `pc_service/tools/stub_stale.py`
+
+A companion to the existing `stub_503.py`, and for the same reason: the
+interesting branches are the ones that are hard to reach by waiting. It serves
+a well-formed 200 whose `updated_epoch` is however far in the past you ask
+for, so the firmware takes exactly the path it would take against a genuinely
+stalled service.
+
+```
+python tools/stub_stale.py 900        # 15 min old  -> amber STALE badge
+python tools/stub_stale.py 2400       # 40 min old  -> numbers go grey
+python tools/stub_stale.py 60 --flag  # fresh, but flagged stale by the PC
+```
+
+The `--flag` form covers the case the age cannot: `stale: true` and the
+computed age are independent signals, and the flag alone has to be enough to
+raise the badge — that is the case where `pc_service` is alive and its own
+upstream call failed.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -349,6 +498,28 @@ catches cheaply.
   The full byte: `0x80` MY flips vertically, `0x40` MX flips horizontally,
   `0x20` MV rotates 90°, `0x08` selects BGR. If orientation ever needs
   revisiting, those four bits are the whole search space.
+- **The panel runs fine at 40 MHz SPI** on this wiring, raised from the
+  bring-up value of 10 MHz at stage 8. No tearing, snow or colour faults over
+  the jumper wires in use. If it ever misbehaves after a rewiring, putting
+  `SPI_CLOCK_HZ` in `gc9a01.c` back to 10 MHz is the one-line thing to rule
+  out first — long jumpers are the usual reason a panel that works at 10 does
+  not work at 40.
+- **Free heap sits at roughly 191-192 KB with the refresh loop running**, and
+  stays there across successful fetches, failed fetches and recoveries alike.
+  That is the number to watch: this is the first code in the project that runs
+  forever, so a leak of a few hundred bytes per fetch is invisible in one
+  request and fatal within a day. A steadily falling number means a missing
+  `esp_http_client_cleanup` or `cJSON_Delete`.
+- **A failing refresh cycle takes 55 seconds, not 45.** The interval is
+  measured from the end of the previous attempt, and connecting to a dead port
+  burns the full 10-second HTTP timeout first. Intended — it spaces retries
+  rather than bunching them — but it does mean the banner's age counts up in
+  ~55s steps during an outage, not 45s ones.
+- **On a round panel, "does it fit" has a different answer at every row**, and
+  the answer at the *bottom* of a glyph is the one that decides. The banner row
+  moved from y=205 to y=202 at stage 8 for exactly three pixels of headroom:
+  at 205 the budget is eleven characters and `"BAD DATA 12M"` is twelve.
+  `BANNER_MAX_CHARS` records the budget so it does not have to be rediscovered.
 - **Watch out for more than one ESP-IDF install on the same machine.** This
   build has been developed against ESP-IDF **v5.3.5**, pinned locally through
   the VS Code extension's `idf.currentSetup` setting (`firmware/.vscode/` is
@@ -567,46 +738,48 @@ file hashes.
 
 ## Next session — start here
 
-**Stage 8: polish — and it is the last stage.** Three things, per
-`CLAUDE.md`'s definition of done: a periodic refresh every 30-60s, WiFi
-reconnect handling, and a visible fallback when the service or network drops.
+**The build order is finished.** Every stage in `CLAUDE.md` is done and
+verified on hardware, and the definition of done is met: the chip shows both
+percentages and their reset times, refreshes itself every 45 seconds, and
+degrades visibly rather than silently when the service or the network drops.
 
-What is already in place: every fetch outcome already reaches the screen
-(`NO LINK`, `NO DATA`, `BAD DATA`), the reconnect timer already retries
-forever without blocking the event loop, and `gc9a01_fill_rect` already
-exists for partial redraws. So stage 8 is mostly turning one-shot code into
-a loop and making the failure states considered rather than minimal.
+So there is no next stage — only candidates, none of them required:
 
-Four things worth knowing before starting:
+- **The expressive face.** Deferred since stage 6 with the condition "revisit
+  once the display works and the real free-flash number is known". Both are now
+  true: the display works, and the app partition has **about 70 KB free** after
+  stage 8 (`0x119a0`, 7% of the partition). The analysis in the deferred list
+  below still stands, and the note there about designing it *together with* the
+  fallback state is now the more interesting half — stage 8 built those
+  fallbacks as text banners, and a distinctive "asleep" face would be a
+  stronger visible degrade than a word. Doing it means revisiting the layout,
+  not adding to it.
+- **A DHCP reservation for the PC**, so `PC_SERVICE_HOST` in `secrets.h` stops
+  being a thing that can silently rot. This is a router change, not a code one,
+  and it is the single most likely cause of a mystery failure weeks from now.
+- **Starting `pc_service` automatically** on login or as a service. It is
+  started by hand today, which is fine while the project is being worked on and
+  is the main reason the screen says `NO LINK` between sessions.
+- **A long soak.** The longest continuous run so far is a few minutes.
+  Nothing suggests a problem — the heap is flat and the failure paths recover
+  — but "flat over four minutes" and "flat over four days" are different
+  claims, and only one of them has been made.
 
-- **Reset the accumulator each time round the loop.** `body.len` and
-  `body.truncated` are initialised once per task run today. In a loop, the
-  second response would append to the first and cJSON would see garbage.
-  This has been the known trap since stage 5.
-- **Do not repaint the whole screen every refresh.** `render_usage` currently
-  fills black and redraws everything, which is fine once at boot and will
-  visibly flash once a minute. `fill_rect` over just the changed field is the
-  fix; what is missing is remembering what was drawn last.
-- **Drawing must stay on one task.** `gc9a01` is not thread-safe and nothing
-  guards it. Today app_main draws only before creating the fetch task. A
-  refresh loop must not break that, or it needs a lock.
-- **`updated_epoch` vs `now_epoch` is the real staleness signal**, and stage 8
-  is where it becomes a decision rather than a printed number: at some age,
-  numbers should stop being shown as if current. The `stale` flag from the
-  service is the other half of that.
-
-Two smaller candidates, neither required: raise the SPI clock from 10 MHz
-toward 40 MHz (worth doing on its own, with the screen already working), and
-the deferred expressive-face idea below, now that the flash budget is known.
-
-`pc_service` must be **running** for stage 8.
+`pc_service` must be **running** for any firmware work.
 
 ## Deferred, deliberately
 
 - **Cross-platform preflight** (print LAN IPs, the exact `secrets.h` URL,
   firewall diagnosis on startup). Proposed, not built — `pc_service/README.md`
-  covers the same ground in prose. Revisit at the polish stage if the chip is
-  hard to debug.
+  covers the same ground in prose. The trigger written here was "revisit at the
+  polish stage if the chip is hard to debug"; it wasn't, so this stays unbuilt.
+  The one real gap it would close is a stale `PC_SERVICE_HOST` after DHCP moves
+  the PC, and a router reservation closes that more cheaply.
+- **Raising the SPI clock from 10 MHz toward 40** — listed as a candidate
+  before stage 8 and **done during it**, in its own commit, per the instruction
+  the code comment had carried since stage 6: on its own, with the screen
+  already working, so a failure would have one suspect rather than two. No
+  artefacts at 40 MHz on this wiring.
 - **`POLL_INTERVAL_SECONDS` was raised from 60 to 120** — its written trigger
   ("raise it only if 429s recur with a single instance") fired at stage 6.
   Measured over an hour at 60s: 13 of 45 polls refused, in a metronomic
@@ -650,10 +823,11 @@ the deferred expressive-face idea below, now that the flash budget is known.
   | Full-colour RGB565 sprite | ~28.8 KB at 120px | Four faces ≈ the entire remaining budget |
 
   Constraint that drives the choice: **a single 240x240 RGB565 frame is
-  115,200 bytes**, and free space is shrinking as stages land — about 103 KB
-  after stage 5, about **74 KB after stage 6**, with stage 7's fonts still to
-  come — so one full-screen stored frame does not fit at all, and
-  literal GIF playback is out unless the partition table changes. A GIF
+  115,200 bytes**, and free space shrank as stages landed — about 103 KB after
+  stage 5, about 74 KB after stage 6, and **about 70 KB now that stage 8 has
+  landed** (`0x119a0`, 7% of the app partition). So one full-screen stored
+  frame does not fit at all, and literal GIF playback is out unless the
+  partition table changes. A GIF
   *decoder* would be the wrong tool regardless: the assets are fixed at
   build time, so shipping an LZW decoder to unpack something that could
   have been pre-converted is pure overhead.
@@ -668,6 +842,11 @@ the deferred expressive-face idea below, now that the flash budget is known.
   visible degrade for "service unreachable" than a text banner, which is
   the definition-of-done requirement anyway — so this idea and stage 8's
   fallback state want designing together.
+
+  Stage 8 has now built those fallbacks *as* text banners (`NO LINK 3M` and
+  friends), deliberately, so that stage stayed verifiable against the brief
+  rather than mixing a redesign into it. That makes the face a layout revision
+  rather than an addition, and the banners are the thing it would replace.
 
 ## Housekeeping
 
@@ -694,5 +873,16 @@ up to two minutes to appear; until then `/usage` answers 503 and the chip
 shows `NO DATA`, both of which are correct behaviour rather than faults.
 
 **The chip keeps running whether or not the service does.** With the service
-stopped it displays `NO LINK` after a ten-second timeout, which is the
-expected picture between sessions and not something to debug.
+stopped it keeps the last numbers it fetched and raises a `NO LINK` banner
+under them, with the age counting up in ~55-second steps; past thirty minutes
+the numbers themselves go grey. That is the expected picture between sessions
+and not something to debug — and it is the honest reason the screen is not
+blank overnight: those numbers are hours old, and the display says so.
+
+`pc_service/tools/` holds two throwaway stand-ins for reaching the failure
+branches on demand rather than by waiting: `stub_503.py` (the "no data yet"
+state) and `stub_stale.py <seconds> [--flag]` (data of any chosen age, and the
+`stale` flag independently). Stop the real service first — both bind 8734, and
+the second to start fails loudly rather than sharing it. Run them with the same
+`python.exe` the real service uses, since the Windows firewall rule is
+per-program.

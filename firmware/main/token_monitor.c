@@ -1,21 +1,32 @@
-/* Token monitor -- firmware stage 7: the usage numbers, on the screen.
+/* Token monitor -- firmware stage 8: the polish that makes it a gadget.
  *
- * This is the stage where the project does the thing it exists for. Every
- * earlier stage built one half of it and proved that half alone: stage 3 joins
- * WiFi, stage 4 proved the HTTP client, stage 5 fetches the real pc_service
- * JSON and parses it into a usage_t, stage 6 got the round panel lit. Stage 7
- * is the join -- usage_t rendered onto the glass, so the gadget is readable
- * without a serial monitor attached.
+ * Stage 7 did the thing this project exists for: usage numbers, on the glass.
+ * It did it exactly once, at boot. Stage 8 is the difference between that and
+ * something you can leave on a desk -- it refreshes on its own every 45
+ * seconds, survives the router rebooting, and when it cannot get fresh numbers
+ * it says so on the screen instead of quietly showing you yesterday's.
  *
- * What is deliberately still missing is stage 8: this draws exactly once, at
- * boot. There is no refresh loop, no reconnect handling, and the failure
- * screens are the minimum that stops the display from lying rather than the
- * considered states the brief asks for.
+ * Three things, per CLAUDE.md's definition of done:
+ *
+ *   1. A refresh loop. usage_task replaces stage 7's one-shot fetch task, and
+ *      only repaints the lines that actually changed -- repainting all 240x240
+ *      once a minute is a black flash you cannot stop watching.
+ *   2. WiFi that recovers visibly. The retry timer already never gave up;
+ *      what is new is that it backs off, and that a dropped link reaches the
+ *      display instead of only the serial log.
+ *   3. Failure states that degrade rather than blank. Once a reading has been
+ *      seen, a failed fetch keeps the numbers and puts a banner over them
+ *      saying what went wrong and how old they now are. The words-only screens
+ *      are reserved for having nothing to show at all.
+ *
+ * The idea running through all three is that the screen must never be able to
+ * lie by omission. A number with no indicator means it is current; that is a
+ * promise, and every branch here exists to keep it.
  *
  * Success looks like: a colour cycle, "CONNECTING", then both percentages with
- * their reset times. pc_service must be RUNNING on the PC named by
- * PC_SERVICE_HOST in secrets.h -- otherwise the screen says NO LINK, which is
- * itself the correct behaviour.
+ * their reset times, updating quietly every 45 seconds. pc_service must be
+ * RUNNING on the PC named by PC_SERVICE_HOST in secrets.h -- otherwise the
+ * screen says NO LINK, which is itself the correct behaviour.
  *
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED, top to bottom:
@@ -25,22 +36,24 @@
  *   3. module state             -- the handful of file-scope variables
  *   4. WiFi event handlers      -- code the WiFi driver calls back into
  *   5. the JSON contract        -- stage 5: usage_t and its parser
- *   6. the screen               -- stage 7: palette, layout, render functions
- *   7. the usage fetch          -- the request, and what each outcome shows
+ *   6. the screen               -- palette, layout, staleness, rendering
+ *   7. the request and the loop -- stage 8: one fetch, then forever
  *   8. wifi_start()             -- one-time setup, in dependency order
  *   9. app_main()               -- the entry point; where execution begins
  *
  * One rule that is invisible in the code: gc9a01 is not thread-safe, and
- * drawing happens from two places -- app_main (the boot messages) and the
- * fetch task (everything after). They never overlap, because app_main draws
- * only before creating that task and never again. If a later stage adds a
- * second drawing task, that stops being true and needs a lock.
+ * drawing happens from two places -- app_main (the boot messages) and
+ * usage_task (everything after). They never overlap, because app_main draws
+ * only before creating that task and never again. That is an ordering
+ * guarantee held by convention, with nothing enforcing it: a second drawing
+ * task needs a mutex first.
  *
  * The control flow is NOT top-to-bottom like a script. app_main() sets things
- * up and then *sleeps*; the interesting work happens in the event handlers,
- * which run on a different task entirely, whenever the radio has news. If you
- * read only one comment in this file, make it the one above s_reconnect_timer
- * -- that distinction is the source of the one real bug this file has had.
+ * up and then *sleeps*; the interesting work happens on other tasks -- the
+ * event handlers, which run whenever the radio has news, and usage_task, which
+ * owns the display. If you read only one comment in this file, make it the one
+ * above s_reconnect_timer -- that distinction is the source of the one real
+ * bug this file has had.
  * ---------------------------------------------------------------------------
  */
 
@@ -81,6 +94,9 @@
                                       * in CMakeLists.txt, same as the HTTP
                                       * client was; no download needed)     */
 #include "esp_log.h"                 /* ESP_LOGI / ESP_LOGW / ESP_LOGE      */
+#include "esp_system.h"              /* esp_get_free_heap_size -- stage 8
+                                      * watches it, because this is the
+                                      * first code here that runs forever  */
 
 #include "gc9a01.h"                  /* stage 6: the round display driver,
                                       * hand-rolled on spi_master + gpio    */
@@ -110,6 +126,36 @@ static EventGroupHandle_t s_wifi_events;
  * tries is useless if the router reboots overnight. Proper backoff and a
  * visible "disconnected" state on the display are stage 8. */
 static int s_retry_count = 0;
+
+/* True once a DHCP lease has ever been obtained. It separates "has not
+ * associated yet" from "was connected and lost it" -- indistinguishable to the
+ * radio, but the difference between showing CONNECTING and showing NO WIFI,
+ * and therefore between a gadget that looks like it is starting up and one
+ * that looks broken every time it boots.
+ *
+ * Written on the event loop task, read on the display task. `volatile` because
+ * the compiler must not cache it in a register across the loop below; a single
+ * aligned bool needs nothing stronger than that on this chip. */
+static volatile bool s_ever_connected = false;
+
+/* How long to wait before the next reconnect attempt.
+ *
+ * Fixed at 2 seconds through stage 7, which is right for the common case and
+ * wrong for the uncommon one. STATUS.md records ordinary boots needing up to
+ * three retries before associating -- so the first few must stay fast, or the
+ * gadget takes a minute to start on a network it can perfectly well join. But
+ * a router that is off for the night should not be probed eighteen hundred
+ * times an hour to no purpose.
+ *
+ * The policy is unchanged and deliberate: retry forever. A desk gadget that
+ * gives up after five attempts is useless the first time the router reboots
+ * overnight. This only changes the spacing. */
+static uint32_t reconnect_delay_ms(int retry)
+{
+    if (retry <= 3)  { return 2000; }    /* the observed boot case          */
+    if (retry <= 10) { return 5000; }    /* a brief outage                  */
+    return 30000;                        /* something is off; stop hammering */
+}
 
 /* One-shot timer used to space out reconnect attempts.
  *
@@ -185,8 +231,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * (two disconnects in quick succession), which would otherwise return
          * an error; it is a harmless no-op when the timer is idle. esp_timer
          * counts in MICROseconds, hence 2000 * 1000 for two seconds. */
+        uint32_t delay_ms = reconnect_delay_ms(s_retry_count);
+        ESP_LOGW(TAG, "retrying in %" PRIu32 " ms", delay_ms);
+
         esp_timer_stop(s_reconnect_timer);
-        ESP_ERROR_CHECK(esp_timer_start_once(s_reconnect_timer, 2000 * 1000));
+        ESP_ERROR_CHECK(esp_timer_start_once(s_reconnect_timer,
+                                             (uint64_t)delay_ms * 1000));
         return;
     }
 }
@@ -200,7 +250,9 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
 
-    s_retry_count = 0;               /* a success resets the retry tally    */
+    s_retry_count = 0;               /* a success resets the retry tally,
+                                      * and with it the backoff spacing     */
+    s_ever_connected = true;
 
     /* IPSTR and IP2STR are a matched pair of ESP-IDF macros for printing an
      * IP address: IPSTR expands to the "%d.%d.%d.%d" format string, IP2STR
@@ -435,8 +487,9 @@ static bool parse_usage(const char *json, int len, usage_t *out)
          * is the safe default because it is not the only freshness signal:
          * updated_epoch against now_epoch gives the true age independently, so
          * a missing `stale` field degrades to "trust the clock" rather than
-         * flashing a stale badge over a typo'd field name. Stage 8 is where
-         * that age becomes a decision rather than a printed number. */
+         * flashing a stale badge over a typo'd field name. data_age_seconds()
+         * is where that clock is read, and build_banner where it becomes a
+         * decision rather than a printed number. */
         out->stale = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "stale"));
     }
 
@@ -490,8 +543,10 @@ static void print_usage(const usage_t *u)
     /* The chip has no reliable clock of its own (no RTC battery, no SNTP), and
      * that is exactly why the contract ships now_epoch alongside updated_epoch:
      * both come from the PC, so subtracting them gives a true age without the
-     * chip needing to know what time it is. This is the number stage 8 will
-     * use to decide when data is too old to show at all. */
+     * chip needing to know what time it is. data_age_seconds() computes the
+     * same number for the display, with one addition: the time elapsed on this
+     * chip since the fetch, which is what keeps the age honest once the
+     * service stops answering at all. */
     if (u->updated_epoch > 0 && u->now_epoch > 0) {
         printf("  data age: %" PRId64 "s by the PC's clock\n",
                u->now_epoch - u->updated_epoch);
@@ -499,7 +554,7 @@ static void print_usage(const usage_t *u)
     printf("---8<--- end ------8<---\n");
 }
 
-/* --- stage 7: putting it on the screen ------------------------------------ */
+/* --- the screen ----------------------------------------------------------- */
 
 /* The palette. Defined here rather than in gc9a01.h because these are choices
  * about this product, not facts about the panel -- the driver supplies
@@ -510,6 +565,8 @@ static void print_usage(const usage_t *u)
 #define COL_OK     GC9A01_RGB( 45, 200,  95)
 #define COL_WARN   GC9A01_RGB(240, 175,  45)
 #define COL_ALERT  GC9A01_RGB(235,  65,  60)
+#define COL_DEAD   GC9A01_RGB( 95, 100, 110)   /* stage 8: a number that is
+                                                * no longer about now       */
 
 /* The layout, as named constants rather than numbers buried in the drawing
  * code, because the useful question about a round display is always "does this
@@ -518,8 +575,8 @@ static void print_usage(const usage_t *u)
  * The panel is 240x240 but *round*: the controller addresses the full square
  * and the corners are simply behind the bezel. The usable half-width at a
  * given row y is sqrt(120^2 - (y-120)^2), so the top and bottom rows here are
- * the tight ones -- at y=28 there are about 154 usable pixels, at y=205 about
- * 135. Every line below is comfortably inside that. */
+ * the tight ones -- at y=28 there are about 154 usable pixels, at y=202 about
+ * 146. Every line below is comfortably inside that. */
 #define ROW_5H_LABEL   28
 #define ROW_5H_VALUE   46
 #define ROW_5H_RESET   86
@@ -527,10 +584,101 @@ static void print_usage(const usage_t *u)
 #define ROW_7D_LABEL  122
 #define ROW_7D_VALUE  140
 #define ROW_7D_RESET  180
-#define ROW_STALE     205
+#define ROW_BANNER    202
 
 #define SCALE_LABEL  2       /* 12x14 px per character */
 #define SCALE_VALUE  5       /* 30x35 -- the number you read from across a desk */
+
+/* The banner is the one line that says whether to believe the numbers above
+ * it, and it sits low on a *round* panel, where the width runs out fast. Its
+ * bottom row of pixels is y = ROW_BANNER + 13 = 215, where the circle is
+ * 2*sqrt(120^2 - 95^2) = 146 pixels across. Twelve characters at SCALE_LABEL
+ * measure 12*12 - 2 = 142 pixels of ink, so twelve fit and thirteen do not.
+ *
+ * That is why this is 202 and not stage 7's 205: at 205 the budget is eleven
+ * characters and "BAD DATA 12M" is twelve. Three pixels of headroom bought the
+ * longest string this screen needs to say. BANNER_CAP is one more than the
+ * budget, for the NUL, and snprintf is what enforces it. */
+#define BANNER_MAX_CHARS 12
+#define BANNER_CAP       (BANNER_MAX_CHARS + 1)
+
+/* --- stage 8: how old is too old ------------------------------------------
+ *
+ * The chip refreshes every 45 seconds; pc_service polls Anthropic every 120.
+ * So in normal running the numbers on screen are between 0 and 120 seconds
+ * old, and that is not staleness -- that is just how the cache works.
+ *
+ * The thresholds below come from pc_service's documented backoff (120s ->
+ * 240s -> 480s -> capped 900s, reset on success; see STATUS.md), because that
+ * backoff is what decides how old the data can get while everything is in fact
+ * working correctly:
+ *
+ *   one upstream 429  ->  next success at t=360s  ->  age reaches  6 minutes
+ *   two in a row      ->  next success at t=840s  ->  age reaches 14 minutes
+ *
+ * Both of those are healthy, self-recovering conditions. A badge at 5 minutes
+ * would fire on the first, and greying the numbers at 15 would fire on the
+ * second. That is exactly the cry-wolf problem that pushed the poll interval
+ * from 60s to 120s: an indicator that is wrong a third of the time is one you
+ * learn to ignore, and then it cannot tell you the thing it exists for.
+ *
+ * So: badge above the one-429 case and below the 900s cap; grey out only past
+ * anything the backoff can produce at all.
+ *
+ * Neither is the primary alarm. A PC that has actually gone away also fails
+ * the fetch outright, which puts NO LINK on the screen within one 45s cycle.
+ * These two thresholds are the backstop for the quieter failure -- a service
+ * that is still answering, politely, with data from an hour ago. */
+#define REFRESH_INTERVAL_MS  45000    /* the brief asks for 30-60s           */
+#define STALE_BADGE_AGE_S      600    /* 10 min: badge it                    */
+#define STALE_DEAD_AGE_S      1800    /* 30 min: stop colouring it as a fact */
+
+/* The last reading that parsed, and when this chip received it.
+ *
+ * Kept so a failed fetch can go on showing real numbers instead of blanking to
+ * an error -- which is what ARCHITECTURE.md asks for, and the difference
+ * between a gadget that degrades and one that simply breaks. */
+static usage_t s_last_good;
+static bool    s_have_good;
+static int64_t s_last_good_us;      /* esp_timer_get_time() at that moment */
+
+/* How old the numbers on screen actually are, in seconds; -1 if there are none
+ * yet.
+ *
+ * Two clocks add up here, and both halves are load-bearing:
+ *
+ *   now_epoch - updated_epoch   how stale the data already was when the PC
+ *                               handed it over. Both values come from the PC,
+ *                               so this needs no clock on the chip at all --
+ *                               which is the whole reason the contract ships
+ *                               the pair instead of just an "HH:MM" string.
+ *
+ *   esp_timer since the fetch   how long ago that was. This is the half that
+ *                               keeps working during an outage: with the
+ *                               service unreachable no new now_epoch arrives,
+ *                               so without it the age would freeze at whatever
+ *                               it was when the link died, and a dead PC would
+ *                               look eternally fresh.
+ *
+ * esp_timer counts microseconds since boot and never runs backwards. This chip
+ * cannot tell you what time it is; it can measure an interval exactly. */
+static int64_t data_age_seconds(void)
+{
+    if (!s_have_good) {
+        return -1;
+    }
+
+    int64_t reported = 0;
+    if (s_last_good.updated_epoch > 0 && s_last_good.now_epoch > 0) {
+        reported = s_last_good.now_epoch - s_last_good.updated_epoch;
+        if (reported < 0) {
+            reported = 0;    /* the PC's own two timestamps disagreeing is a
+                              * PC problem; it is not a negative age         */
+        }
+    }
+
+    return reported + (esp_timer_get_time() - s_last_good_us) / 1000000;
+}
 
 /* Green while there is room, amber when it is worth noticing, red when it is
  * nearly gone. The thresholds are a judgement, not a standard: 50% of a
@@ -586,89 +734,286 @@ static void draw_centred(int y, const char *text, uint16_t fg, int scale)
     gc9a01_draw_text(x, y, text, fg, COL_BG, scale);
 }
 
-/* Anything that is not a reading: "CONNECTING", "NO LINK", and so on. Keeping
- * these on one code path means the screen can never sit showing a stale
- * message that has quietly stopped being true -- whatever happened last is
- * what is on the glass. Stage 8 makes these states richer; this is the
- * minimum that stops the display from lying. */
+/* --- stage 8: a model of what is currently on the glass --------------------
+ *
+ * Stage 7 repainted all 240x240 every time it drew. Once, at boot, that is
+ * invisible. Once every 45 seconds it is a black flash you cannot help
+ * watching -- and it happens whether or not a single digit changed, which is
+ * the part that makes a working gadget feel broken.
+ *
+ * The fix is not a faster fill, it is not filling: remember what was drawn,
+ * compare, and touch only the lines that actually differ. In steady state
+ * nothing differs at all, so a refresh writes zero pixels and the screen is
+ * simply still.
+ *
+ * Rows, not pixels. Every line here is centred, so a shorter string starts
+ * further right and would leave the tail of the previous one stranded beside
+ * it. Clearing the full width of the row band first makes that impossible, and
+ * a 240x14 band is far too cheap to be worth outsmarting.
+ *
+ * All of this state is plain, unlocked, and touched from exactly one task --
+ * see the note at the top of the file. It stays correct only while that is
+ * true. */
+
+typedef enum {
+    SCREEN_NOTHING,    /* nothing drawn yet: the first draw must be a full one */
+    SCREEN_MESSAGE,    /* words only: CONNECTING, NO LINK, ...                 */
+    SCREEN_USAGE,      /* the real layout: labels, numbers, reset times        */
+} screen_mode_t;
+
+typedef enum {
+    SLOT_5H_VALUE,
+    SLOT_5H_RESET,
+    SLOT_7D_VALUE,
+    SLOT_7D_RESET,
+    SLOT_BANNER,
+    SLOT_COUNT
+} slot_id_t;
+
+/* One redrawable line. `text` and `fg` hold what is *on the panel*, not what
+ * is wanted -- the comparison between those two is the whole mechanism.
+ *
+ * The buffer has to be the largest thing any slot can hold: a reset time from
+ * the PC (TIME_STR_CAP) or a banner (BANNER_CAP), whichever is bigger. */
+typedef struct {
+    int      y;
+    int      scale;
+    char     text[TIME_STR_CAP > BANNER_CAP ? TIME_STR_CAP : BANNER_CAP];
+    uint16_t fg;
+} slot_t;
+
+static slot_t s_slots[SLOT_COUNT] = {
+    [SLOT_5H_VALUE] = { .y = ROW_5H_VALUE, .scale = SCALE_VALUE },
+    [SLOT_5H_RESET] = { .y = ROW_5H_RESET, .scale = SCALE_LABEL },
+    [SLOT_7D_VALUE] = { .y = ROW_7D_VALUE, .scale = SCALE_VALUE },
+    [SLOT_7D_RESET] = { .y = ROW_7D_RESET, .scale = SCALE_LABEL },
+    [SLOT_BANNER]   = { .y = ROW_BANNER,   .scale = SCALE_LABEL },
+};
+
+static screen_mode_t s_mode = SCREEN_NOTHING;
+static char s_msg1[24];    /* the message screen's two lines, remembered for  */
+static char s_msg2[24];    /* the same reason: don't repaint an unchanged one */
+
+/* Draw one line, but only if it is not already there.
+ *
+ * The empty string is a real value meaning "nothing on this row": the band is
+ * cleared and nothing is drawn. That is how the stale badge disappears again
+ * when the data goes fresh. */
+static void set_slot(slot_id_t id, const char *text, uint16_t fg)
+{
+    slot_t *s = &s_slots[id];
+
+    if (s->fg == fg && strcmp(s->text, text) == 0) {
+        return;
+    }
+
+    gc9a01_fill_rect(0, s->y, GC9A01_WIDTH, GC9A01_CHAR_H * s->scale, COL_BG);
+    if (text[0] != '\0') {
+        draw_centred(s->y, text, fg, s->scale);
+    }
+
+    snprintf(s->text, sizeof(s->text), "%s", text);
+    s->fg = fg;
+}
+
+/* Forget everything, so the next set_slot on each row draws unconditionally.
+ * Must follow every full-screen fill: the panel is black again, and if the
+ * model still claims otherwise, every row it believes unchanged stays blank. */
+static void forget_slots(void)
+{
+    for (int i = 0; i < SLOT_COUNT; i++) {
+        s_slots[i].text[0] = '\0';
+        s_slots[i].fg = COL_BG;
+    }
+}
+
+/* Compact enough for the banner's twelve characters, and never more than three
+ * of them: "45S", "9M", "23H", "99D". Deliberately coarse -- the question it
+ * answers is "should I believe the number above this", and nobody needs
+ * seconds of precision to decide that. */
+static void format_age(int64_t secs, char *out, size_t cap)
+{
+    if (secs < 0)       { snprintf(out, cap, "?");                        return; }
+    if (secs < 60)      { snprintf(out, cap, "%dS", (int)secs);           return; }
+    if (secs < 3600)    { snprintf(out, cap, "%dM", (int)(secs / 60));    return; }
+    if (secs < 86400)   { snprintf(out, cap, "%dH", (int)(secs / 3600));  return; }
+    if (secs < 8640000) { snprintf(out, cap, "%dD", (int)(secs / 86400)); return; }
+
+    /* Past a hundred days the exact number has stopped being the interesting
+     * part of the message. */
+    snprintf(out, cap, "OLD");
+}
+
+/* Builds the bottom line and returns the colour to draw it in. An empty result
+ * means "say nothing", which is itself the design: the badge appears only when
+ * something is wrong, so its presence is information rather than decoration. */
+static uint16_t build_banner(const usage_t *u, const char *reason,
+                             int64_t age_s, char *out, size_t cap)
+{
+    char age[8];
+    format_age(age_s, age, sizeof(age));
+
+    /* Red once the numbers have stopped being current, amber while they are
+     * merely old. The same rule for both branches below. */
+    const uint16_t severity =
+        (age_s >= 0 && age_s >= STALE_DEAD_AGE_S) ? COL_ALERT : COL_WARN;
+
+    /* A reason means this refresh failed outright, and that outranks whatever
+     * the payload said about itself -- the payload is, by definition, the
+     * previous one. */
+    if (reason != NULL) {
+        snprintf(out, cap, "%s %s", reason, age);
+        return severity;
+    }
+
+    /* Two independent ways to be stale, and either one is enough on its own.
+     * The flag is pc_service reporting that its own upstream call failed; the
+     * age is this chip working it out from the clock pair. Neither can see
+     * what the other sees -- the flag cannot arrive at all if the service is
+     * unreachable, and the age cannot tell a slow poll from a broken one. */
+    if (u->stale || (age_s >= 0 && age_s >= STALE_BADGE_AGE_S)) {
+        snprintf(out, cap, "STALE %s", age);
+        return severity;
+    }
+
+    out[0] = '\0';
+    return COL_BG;
+}
+
+/* Anything that is not a reading: "CONNECTING", "NO LINK", and so on.
+ *
+ * Reached only when there is no last-known data to show instead -- see
+ * show_failure. Once a real reading has arrived, a failure becomes a banner
+ * over the numbers rather than a screen that replaces them. */
 static void render_message(const char *line1, const char *line2)
 {
+    if (line2 == NULL) {
+        line2 = "";
+    }
+
+    /* Already saying exactly this. Repainting would blink it once every
+     * refresh for no reason, and a screen that blinks on a schedule teaches
+     * you to stop looking at it. */
+    if (s_mode == SCREEN_MESSAGE &&
+        strcmp(s_msg1, line1) == 0 && strcmp(s_msg2, line2) == 0) {
+        return;
+    }
+
     gc9a01_fill_screen(COL_BG);
     draw_centred(100, line1, COL_TIME, 3);
-    if (line2 != NULL) {
+    if (line2[0] != '\0') {
         draw_centred(140, line2, COL_LABEL, SCALE_LABEL);
     }
+
+    snprintf(s_msg1, sizeof(s_msg1), "%s", line1);
+    snprintf(s_msg2, sizeof(s_msg2), "%s", line2);
+    s_mode = SCREEN_MESSAGE;
+    forget_slots();
 }
 
 /* The actual point of the whole project: usage_t, on the glass.
  *
- * This repaints the entire screen, which is fine for a single draw at boot and
- * will not be at stage 8 -- repainting every field once a minute makes the
- * whole display visibly flash even when only one digit changed. The primitive
- * needed to fix that (fill_rect over just the changed region) already exists;
- * what is missing is remembering what was drawn last, which is state that
- * belongs with the refresh loop rather than here. */
-static void render_usage(const usage_t *u)
+ * `reason` is NULL when this reading is the one just fetched, or a short word
+ * (BANNER_MAX_CHARS minus room for " 12M") when it is the last known reading
+ * being shown because a fetch failed. `age_s` is how old the numbers are, or
+ * -1 if that is unknown. */
+static void render_usage(const usage_t *u, const char *reason, int64_t age_s)
 {
-    char buf[8];
+    char buf[12];
 
-    gc9a01_fill_screen(COL_BG);
+    /* The parts that never change are drawn once, on arriving at this screen
+     * from another. After that only the five slots below are touched, which is
+     * what makes a refresh cost nothing when nothing has changed. */
+    if (s_mode != SCREEN_USAGE) {
+        gc9a01_fill_screen(COL_BG);
+        forget_slots();
+        draw_centred(ROW_5H_LABEL, "5-HOUR", COL_LABEL, SCALE_LABEL);
+        draw_centred(ROW_7D_LABEL, "7-DAY",  COL_LABEL, SCALE_LABEL);
+        /* A hairline, not a box. It separates the two readings without
+         * competing with them for attention. */
+        gc9a01_fill_rect(60, ROW_DIVIDER, 120, 2, COL_LABEL);
+        s_mode = SCREEN_USAGE;
+        s_msg1[0] = '\0';
+        s_msg2[0] = '\0';
+    }
 
-    draw_centred(ROW_5H_LABEL, "5-HOUR", COL_LABEL, SCALE_LABEL);
+    /* Past the point where these numbers describe the present, they lose the
+     * green/amber/red they earned and go flat grey. Losing the colour *is* the
+     * signal, and a stronger one than the badge: a red 94% and a grey 94% mean
+     * genuinely different things, and the grey one has no business alarming
+     * anybody. The numbers stay on screen because they are still the last
+     * thing known to be true -- they are just no longer a claim about now. */
+    const bool dead = (age_s >= 0 && age_s >= STALE_DEAD_AGE_S);
+
     snprintf(buf, sizeof(buf), "%d%%", u->five_pct);
-    draw_centred(ROW_5H_VALUE, buf, usage_colour(u->five_pct), SCALE_VALUE);
+    set_slot(SLOT_5H_VALUE, buf, dead ? COL_DEAD : usage_colour(u->five_pct));
     /* "--" rather than an empty gap: the contract allows a null reset time,
      * and a blank line would read as a rendering bug rather than as missing
      * data. */
-    draw_centred(ROW_5H_RESET,
-                 u->five_resets_at[0] ? u->five_resets_at : "--",
-                 COL_TIME, SCALE_LABEL);
+    set_slot(SLOT_5H_RESET, u->five_resets_at[0] ? u->five_resets_at : "--",
+             dead ? COL_DEAD : COL_TIME);
 
-    /* A hairline, not a box. It separates the two readings without competing
-     * with them for attention. */
-    gc9a01_fill_rect(60, ROW_DIVIDER, 120, 2, COL_LABEL);
-
-    draw_centred(ROW_7D_LABEL, "7-DAY", COL_LABEL, SCALE_LABEL);
     snprintf(buf, sizeof(buf), "%d%%", u->seven_pct);
-    draw_centred(ROW_7D_VALUE, buf, usage_colour(u->seven_pct), SCALE_VALUE);
-    draw_centred(ROW_7D_RESET,
-                 u->seven_resets_at[0] ? u->seven_resets_at : "--",
-                 COL_TIME, SCALE_LABEL);
+    set_slot(SLOT_7D_VALUE, buf, dead ? COL_DEAD : usage_colour(u->seven_pct));
+    set_slot(SLOT_7D_RESET, u->seven_resets_at[0] ? u->seven_resets_at : "--",
+             dead ? COL_DEAD : COL_TIME);
 
-    /* Shown only when it is true, so its presence means something. The numbers
-     * above are still real -- they are just not current -- which is why this
-     * is a badge rather than a replacement for them. */
-    if (u->stale) {
-        draw_centred(ROW_STALE, "STALE", COL_WARN, SCALE_LABEL);
+    char banner[BANNER_CAP];
+    uint16_t fg = build_banner(u, reason, age_s, banner, sizeof(banner));
+    set_slot(SLOT_BANNER, banner, fg);
+}
+
+/* --- stage 8: the two ways the screen gets updated ------------------------ */
+
+/* A fetch worked and parsed. Remember it -- including *when* it arrived, which
+ * is what lets the age calculation survive a later outage -- and show it. */
+static void show_usage(const usage_t *u)
+{
+    s_last_good    = *u;
+    s_have_good    = true;
+    s_last_good_us = esp_timer_get_time();
+
+    render_usage(u, NULL, data_age_seconds());
+}
+
+/* A fetch did not work. `reason` goes in the banner, so it has to be short.
+ * `line1`/`line2` are the fallback for when there is nothing better to show.
+ *
+ * ARCHITECTURE.md is specific about the choice being made here: keep showing
+ * the last known values, visibly marked, rather than replacing them with an
+ * error. An old number under a banner saying how old it is remains useful; a
+ * screen reading only NO LINK has thrown away the last thing it knew. So the
+ * words-only screen is reserved for the one case where that really is all
+ * there is -- nothing has ever been fetched successfully. */
+static void show_failure(const char *reason, const char *line1, const char *line2)
+{
+    if (s_have_good) {
+        render_usage(&s_last_good, reason, data_age_seconds());
+    } else {
+        render_message(line1, line2);
     }
 }
 
 /* --- the request itself --------------------------------------------------- */
 
-/* Performs the one request, prints what came back, and deletes itself.
+/* One request: perform it, and put whatever happened on the screen.
  *
- * Still one shot, not a loop: the periodic refresh is stage 8's job, and
- * keeping this single-shot means a failure here is one request to reason
- * about rather than a scrolling log. Power-cycle to run it again.
+ * Split out from the loop below for two reasons. The loop then reads as a
+ * loop, and -- less cosmetically -- `body` is a local that is constructed
+ * fresh on every call.
  *
- * Why this is a task rather than a few lines inside app_main: app_main runs
- * on a task whose stack is CONFIG_ESP_MAIN_TASK_STACK_SIZE, which is 3584
- * bytes here. esp_http_client needs appreciably more than that once lwIP and
- * the HTTP parser are on the stack, and overflowing it produces a stack
- * canary panic and a reboot rather than a tidy error. 8 KB is what ESP-IDF's
- * own esp_http_client example allocates, and it is the number to start from
- * rather than tuning downward without a measurement. cJSON adds little to
- * that: its tree goes on the heap, not on this stack.
+ * That second part is not a style preference. The accumulator carries `len`
+ * and `truncated`, and a version of this that hoisted them out of the loop to
+ * "avoid re-initialising them" would append the second response to the first
+ * and hand cJSON a document with two roots. It has been the known trap since
+ * stage 5, and a local is what makes it structurally impossible rather than
+ * merely remembered.
  *
- * A task that has finished its work must delete itself; falling off the end
- * of a task function without calling vTaskDelete(NULL) crashes the system. */
-static void usage_fetch_task(void *arg)
+ * `storage` is passed in rather than declared here because it is 4 KB and this
+ * runs on a task with 8 KB of stack; it lives in .bss, owned by the caller. */
+static void fetch_once(char *storage, int storage_cap)
 {
-    /* static, so this 4 KB sits in .bss rather than on the task's stack --
-     * which we just went to some trouble to leave room in. */
-    static char storage[BODY_CAP];
-
-    body_buf_t body = { .buf = storage, .cap = sizeof(storage) };
+    body_buf_t body = { .buf = storage, .cap = storage_cap };
     body.buf[0] = '\0';
 
     /* Fields we don't set stay zero, and zero means "the default" throughout
@@ -684,13 +1029,14 @@ static void usage_fetch_task(void *arg)
                                    * fails visibly instead of hanging      */
     };
 
-    ESP_LOGI(TAG, "stage 5: GET %s", USAGE_URL);
-
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
+        /* Out of memory, which on this chip means something else has leaked.
+         * Not fatal -- the loop will try again in 45 seconds -- but the screen
+         * must not go on implying the numbers are current. */
         ESP_LOGE(TAG, "esp_http_client_init failed (out of memory?)");
-        vTaskDelete(NULL);
-        return;                  /* unreachable; states the intent clearly */
+        show_failure("NO LINK", "NO LINK", "OUT OF MEM");
+        return;
     }
 
     /* Ask the server to close the connection once it has answered.
@@ -705,28 +1051,32 @@ static void usage_fetch_task(void *arg)
      *
      * Saying "close" out loud fixes both ends: the server closes the socket
      * itself, in order, and nothing is left parked. Keep-alive would be worth
-     * having if this polled every few seconds, but stage 8 polls once a
-     * minute -- far longer than any server holds an idle connection open, so
-     * the connection would be dead before the next request anyway. */
+     * having if this polled every few seconds, but the refresh interval is 45
+     * -- far longer than any server holds an idle connection open, so the
+     * connection would be dead before the next request anyway. */
     esp_http_client_set_header(client, "Connection", "close");
 
     /* perform() blocks until the whole exchange finishes: connect, request,
      * response, and every on_http_event call above. Note this is NOT wrapped
      * in ESP_ERROR_CHECK -- a failed network request is a normal condition to
      * report, not a reason to abort the program. That rule is the whole reason
-     * stage 8 can have a "service unreachable" screen. */
+     * this stage can have a "service unreachable" screen at all. */
     esp_err_t err = esp_http_client_perform(client);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "request failed: %s", esp_err_to_name(err));
         /* Stage 4 already proved this chip can resolve DNS and reach the
-         * internet, so a failure here is almost certainly on the PC side or in
-         * secrets.h -- worth saying, because the instinct is to blame WiFi. */
-        ESP_LOGE(TAG, "stage 4 reached the internet from this chip, so suspect: "
-                      "pc_service not running; the PC firewall blocking this "
-                      "port; or PC_SERVICE_HOST in secrets.h pointing at an "
-                      "address DHCP has since handed to something else");
-        render_message("NO LINK", "PC SERVICE");
+         * internet, and the loop below has already confirmed WiFi is up before
+         * calling in here -- so a failure at this point is almost certainly on
+         * the PC side or in secrets.h. Worth saying, because the instinct is
+         * to blame WiFi. */
+        ESP_LOGE(TAG, "wifi is up and stage 4 reached the internet from this "
+                      "chip, so suspect: pc_service not running; the PC "
+                      "firewall blocking this port; or PC_SERVICE_HOST in "
+                      "secrets.h pointing at an address DHCP has since handed "
+                      "to something else");
+        show_failure("NO LINK", "NO LINK", "PC SERVICE");
+
     } else {
         int     status = esp_http_client_get_status_code(client);
         int64_t clen   = esp_http_client_get_content_length(client);
@@ -750,17 +1100,16 @@ static void usage_fetch_task(void *arg)
             ESP_LOGE(TAG, "response exceeded BODY_CAP (%d bytes) -- not parsing "
                           "a partial document; raise BODY_CAP if the contract "
                           "really did grow this much", BODY_CAP);
-            render_message("BAD DATA", "TOO LARGE");
+            show_failure("BAD DATA", "BAD DATA", "TOO LARGE");
 
         } else if (status == 200) {
             usage_t usage;
             if (parse_usage(body.buf, body.len, &usage)) {
                 print_usage(&usage);
-                render_usage(&usage);
-                ESP_LOGI(TAG, "stage 7: rendered to the display");
+                show_usage(&usage);
             } else {
                 /* The parse failed, so the raw bytes are the evidence. */
-                render_message("BAD DATA", "NOT JSON");
+                show_failure("BAD DATA", "BAD DATA", "NOT JSON");
                 printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n",
                        body.buf);
             }
@@ -769,34 +1118,103 @@ static void usage_fetch_task(void *arg)
             /* A documented, expected response -- not a failure of this
              * firmware. It means pc_service is up but has never completed a
              * poll (it was just started, or Anthropic is rate-limiting it), so
-             * there is no last-known data to serve even as stale. From stage 7
-             * on this is a "no data" screen, not an error screen. */
+             * there is no last-known data to serve even as stale. This is a
+             * "no data" state, not an error state. */
             char reason[96];
             parse_error_reason(body.buf, body.len, reason, sizeof(reason));
             ESP_LOGW(TAG, "pc_service has no data yet (503): %s", reason);
             ESP_LOGW(TAG, "the network path works -- this is the PC's upstream "
                           "fetch failing, not the chip. Give it a poll interval "
                           "and retry, or read pc_service's own log");
-            render_message("NO DATA", "PC SERVICE");
+            show_failure("NO DATA", "NO DATA", "PC SERVICE");
 
         } else {
             ESP_LOGW(TAG, "unexpected status %d -- the contract only defines "
                           "200 and 503; body follows", status);
-            render_message("BAD DATA", "BAD STATUS");
+            show_failure("BAD DATA", "BAD DATA", "BAD STATUS");
             printf("---8<--- body ---8<---\n%s\n---8<--- end ----8<---\n",
                    body.buf);
         }
     }
 
     /* Always, on every path: cleanup frees the socket and the parser state.
-     * Skipping it leaks a few KB per request, which one request survives and
-     * stage 8's once-a-minute loop would not. */
+     * Skipping it leaks a few KB per request -- which one request survives and
+     * a refresh every 45 seconds absolutely would not. */
     esp_http_client_cleanup(client);
-
-    ESP_LOGI(TAG, "stage 5 complete. heartbeat continues; power-cycle to re-run.");
-    vTaskDelete(NULL);
 }
 
+/* --- stage 8: the refresh loop -------------------------------------------- */
+
+/* The task that owns the display for the rest of the program's life.
+ *
+ * Every drawing call after boot happens on this one task. That is not an
+ * accident of structure, it is the reason gc9a01 needs no mutex: app_main
+ * draws the boot sequence, then creates this task and never draws again. Any
+ * third caller breaks the guarantee and has to add a lock first.
+ *
+ * Why a task rather than a loop inside app_main: app_main runs with
+ * CONFIG_ESP_MAIN_TASK_STACK_SIZE, 3584 bytes here, and esp_http_client needs
+ * appreciably more than that once lwIP and the HTTP parser are on the stack.
+ * Overflowing it produces a stack canary panic and a reboot rather than a tidy
+ * error. 8 KB is what ESP-IDF's own esp_http_client example allocates, and it
+ * is the number to start from rather than tuning downward without a
+ * measurement. cJSON adds little: its tree goes on the heap, not this stack.
+ *
+ * This one never returns, so it never calls vTaskDelete -- unlike stage 7's
+ * one-shot version, which had to. */
+static void usage_task(void *arg)
+{
+    /* static, so this 4 KB sits in .bss rather than on the task's stack --
+     * which we just went to some trouble to leave room in. */
+    static char storage[BODY_CAP];
+
+    while (1) {
+
+        /* Ask the radio before spending a ten-second HTTP timeout discovering
+         * something it already knows. This also gets the diagnosis right on
+         * screen: NO WIFI points at the network, NO LINK points at the PC, and
+         * a firmware that showed NO LINK whenever the router rebooted would
+         * send you to debug the wrong machine. */
+        if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
+
+            /* Two different situations that look identical to the radio. At
+             * boot the chip has simply not associated yet, which takes up to
+             * twenty seconds on this network and is not a fault; after that,
+             * a cleared bit means a link that existed and went away. Saying
+             * CONNECTING for the first and NO WIFI for the second is the
+             * difference between a gadget that looks like it is starting up
+             * and one that looks broken during every normal boot. */
+            if (s_ever_connected) {
+                show_failure("NO WIFI", "NO WIFI", "RECONNECTING");
+            } else {
+                render_message("CONNECTING", NULL);
+            }
+
+            /* Block until the radio is back, or until the refresh interval is
+             * up -- whichever happens first. Waiting on the bit rather than
+             * sleeping on a timer means a reconnect is picked up the moment it
+             * happens, so the screen recovers as fast as the radio does
+             * instead of up to 45 seconds later. The reconnect attempts
+             * themselves are the disconnect handler's job and are already
+             * running; this only waits for them to succeed. */
+            xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT,
+                                pdFALSE, pdTRUE,
+                                pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
+            continue;
+        }
+
+        fetch_once(storage, sizeof(storage));
+
+        /* Free heap on every cycle, because this is the first code in the
+         * project that runs forever: a leak of even a few hundred bytes per
+         * fetch is invisible in one request and fatal within a day, and this
+         * number is what makes it visible. It should be flat. */
+        ESP_LOGI(TAG, "free heap %" PRIu32 " bytes; next refresh in %d s",
+                 esp_get_free_heap_size(), REFRESH_INTERVAL_MS / 1000);
+
+        vTaskDelay(pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
+    }
+}
 
 /* --- setup -------------------------------------------------------------- */
 
@@ -965,38 +1383,37 @@ void app_main(void)
      * fire -- and touch this group -- the instant the radio starts. */
     s_wifi_events = xEventGroupCreate();
 
-    ESP_LOGI(TAG, "stage 5: wifi + one fetch of the real usage JSON");
+    ESP_LOGI(TAG, "stage 8: wifi, then refresh every %d s forever",
+             REFRESH_INTERVAL_MS / 1000);
     wifi_start();
 
-    /* Block until connected. The four arguments after the group are:
-     *   WIFI_CONNECTED_BIT -- which bit(s) to wait for
-     *   pdFALSE            -- do NOT clear the bit on exit; later stages want
-     *                         to keep reading it to see if we are still up
-     *   pdTRUE             -- wait for ALL requested bits (moot with a single
-     *                         bit, but it states the intent correctly)
-     *   portMAX_DELAY      -- wait forever, no timeout
+    /* Stage 7 blocked here until WIFI_CONNECTED_BIT was set, and only then
+     * created the fetch task. Stage 8 does not, and the change matters: the
+     * display task is now the thing that reports on WiFi, so it has to be
+     * running *before* the radio is up in order to say so. Blocking here would
+     * leave the screen frozen on whatever app_main drew last for the whole
+     * join -- which is the exact failure mode the brief asks to avoid.
      *
-     * Waiting forever is acceptable only because the retry loop lives in the
-     * disconnect handler and never gives up. */
-    xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
-
-    ESP_LOGI(TAG, "connected.");
-
-    /* Only now, with a DHCP lease in hand, is it worth making a request.
-     * Association alone is not enough: the radio can be joined while DHCP is
-     * still in progress, and a GET issued then fails with no route.
+     * The task handles a missing connection itself, and waits on the same bit
+     * from there.
+     *
+     * This is also the moment the drawing guarantee is handed over. app_main
+     * has drawn its last pixel above; from the next line on, the display
+     * belongs to usage_task alone and nothing else may touch gc9a01.
      *
      * The five arguments to xTaskCreate are the function, a name for it (it
      * shows up in crash dumps and task lists), the stack size in BYTES, the
      * argument passed to the function, and the priority. 5 is above the idle
      * task and below the WiFi driver's -- the same value ESP-IDF's own HTTP
      * example uses. The sixth parameter would receive a handle for later
-     * control; we don't need one, because the task deletes itself. */
-    xTaskCreate(&usage_fetch_task, "usage_fetch", 8192, NULL, 5, NULL);
+     * control; nothing here needs one, since the task runs for the life of the
+     * program. */
+    xTaskCreate(&usage_task, "usage", 8192, NULL, 5, NULL);
 
     /* Heartbeat, so a silent serial monitor means "the chip crashed or reset"
-     * rather than leaving you guessing whether it is merely idle.
+     * rather than leaving you guessing whether it is merely idle. It is also
+     * the only thing app_main does from here on: it deliberately draws
+     * nothing, so the single-task display guarantee holds.
      *
      * vTaskDelay sleeps this task without burning CPU. Unlike the delay we
      * removed from the event handler, blocking here is correct: app_main's

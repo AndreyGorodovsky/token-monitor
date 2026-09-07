@@ -197,7 +197,16 @@ above.
   `STATUS.md` for why that took until stage 7 to notice). Benefits of the hand-rolled route: no `managed_components/`, no
   internet needed for a first build, and no external dependency to track.
   Revisit `esp_lcd` only if a concrete need appears (e.g. DMA-backed
-  double-buffering or LVGL).
+  double-buffering or LVGL). The SPI clock is 40 MHz, raised from the
+  bring-up value of 10 MHz once the panel was known-good; long jumper wires
+  are the usual reason to have to put it back.
+
+- **Redrawing.** A full-screen repaint on every refresh is a visible black
+  flash once a minute, so the firmware keeps a model of what it last drew and
+  repaints only the rows whose text or colour changed. Rows rather than
+  glyphs: every line is centred, so a shorter string starts further right and
+  would strand the tail of the previous one unless the whole row band is
+  cleared first.
 - **Board notes (from the module's silkscreen):** it has an onboard
   pull-down on CS (`R8`), and the board text explicitly says CS and RST
   don't have to be wired to a GPIO to work — they can be left disconnected
@@ -244,6 +253,36 @@ which needs to stay visible in whatever layout is chosen.
   live or last-known.
 - `pc_service` reachable but `"stale": true` in the response (its own
   upstream call to Anthropic failed) → same stale treatment.
+
+**As built (stage 8).** All three are implemented as a banner on the bottom
+line over the retained numbers — `NO WIFI`, `NO LINK`, `NO DATA`, `BAD DATA`,
+or `STALE`, each followed by the real age of the data (`NO LINK 3M`). The
+words-only screen is reserved for the case where nothing has ever been fetched
+and there is genuinely nothing better to show.
+
+One thing was added that the list above doesn't ask for, because "marked
+stale" turns out to be two different states rather than one. Staleness is
+graded by the data's age, computed from `now_epoch - updated_epoch` plus the
+time elapsed on the chip since that fetch — the second half being what keeps
+the age honest once the service stops answering at all, since no fresh
+`now_epoch` arrives then:
+
+| Age | Treatment |
+|---|---|
+| under 10 min | no banner (unless `"stale": true`, which always shows one) |
+| 10–30 min | amber banner with the age; numbers keep their usage colours |
+| over 30 min | red banner; numbers go flat grey |
+
+The grey-out is the part worth keeping deliberately. A badge says "this might
+be old"; removing the colour says "this is not a statement about now", which
+is a different and stronger claim — and it stops a red 94% from alarming
+someone about a number that stopped being true an hour ago.
+
+The thresholds are set against this service's own backoff rather than picked
+round: a single upstream 429 delays the next successful poll to t=360s and two
+in a row to t=840s, so data can legitimately reach 6 and 14 minutes old with
+nothing wrong. Anything tighter than 10/30 would fire on normal, recovering
+conditions — and an indicator that cries wolf is one that gets ignored.
 
 ## Security summary
 

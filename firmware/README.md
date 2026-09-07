@@ -33,19 +33,59 @@ Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 
 ## Where this is in the build order
 
-**Stage 7: the usage numbers, on the screen** (`CLAUDE.md`'s build order) —
-written, flashed, and verified on hardware. This is where the project does the
-thing it exists for: the chip initializes the panel, joins WiFi, fetches the
-usage JSON, and renders it, so the gadget is readable with no serial monitor
-attached.
+**Stage 8: polish** (`CLAUDE.md`'s build order) — written, flashed, and
+verified on hardware. This is the last stage: every stage in the build order is
+now done, and the chip meets the definition of done.
 
 Stages 3 (WiFi), 4 (HTTP to a throwaway URL), 5 (the real service, parsed with
-cJSON) and 6 (panel bring-up) are all done and verified on hardware.
+cJSON), 6 (panel bring-up) and 7 (rendering) were each verified on hardware
+before this one started.
 
-It still draws **once**, at boot. The refresh loop, reconnect handling and
-considered failure states are stage 8 — the failure screens here are the
-minimum that keeps the display from showing something untrue, not the finished
-design.
+Stage 7 drew **once**, at boot. Stage 8 makes it a device rather than a demo:
+
+- **It refreshes itself** every 45 seconds, and repaints only the lines whose
+  contents actually changed. Repainting all 240×240 once a minute is a black
+  flash you cannot help watching, and it happens whether or not a digit
+  changed — which is what makes a working gadget feel broken.
+- **It recovers from a dropped network** on its own. The reconnect attempts
+  back off (2s while a boot is still settling, then 5s, then 30s) rather than
+  probing a router that is off for the night eighteen hundred times an hour,
+  and a dropped link now reaches the screen instead of only the serial log.
+- **It degrades visibly.** Once a reading has been seen, a failed fetch keeps
+  the numbers on screen and puts a banner over them saying what went wrong and
+  how old they are. The words-only screens are reserved for having nothing to
+  show at all.
+
+### What the screen says, and when
+
+The rule underneath all of it: the display must never be able to lie by
+omission. A number with no banner under it is a promise that the number is
+current, so every branch below exists to keep that promise.
+
+| Situation | What you see |
+|---|---|
+| Fresh data | Two percentages, colour-banded, with their reset times. No banner |
+| `pc_service` flagged its own data stale, or the data is over 10 min old | Same numbers, plus an amber `STALE 15M` banner giving the real age |
+| Data over 30 min old | Numbers go flat grey, banner turns red. They are still the last thing known to be true — just no longer a claim about now |
+| `pc_service` unreachable | Numbers stay, `NO LINK 3M` banner |
+| WiFi dropped | Numbers stay, `NO WIFI 3M` banner |
+| `pc_service` answered 503, or sent something unparseable | Numbers stay, `NO DATA` / `BAD DATA` banner |
+| Any of the above, but nothing has *ever* been fetched | A words-only screen — `CONNECTING`, `NO LINK`, `NO DATA`, `BAD DATA` — because there is genuinely nothing better to show |
+
+Losing the colour at 30 minutes is the strongest signal on the screen, and it
+is deliberate: a red 94% and a grey 94% mean genuinely different things, and
+the grey one has no business alarming anybody.
+
+**Why 10 and 30 minutes**, rather than something tighter. `pc_service` backs
+off when Anthropic rate-limits it — 120s, then 240s, then 480s, capped at 900s
+— so a single upstream 429 lets the data reach 6 minutes old, and two in a row
+14 minutes, with nothing actually wrong. Thresholds of 5 and 15 would fire on
+both. An indicator that is wrong a third of the time is one you learn to
+ignore, and then it cannot tell you the thing it exists for. Neither threshold
+is the primary alarm anyway: a PC that has really gone away also fails the
+fetch, which puts `NO LINK` up within one 45-second cycle. These two are the
+backstop for the quieter failure — a service still answering, politely, with
+data from an hour ago.
 
 Stage 4's throwaway URL was the point of *that* stage: it proved
 `esp_http_client` works on this chip and IDF version before `pc_service` was
@@ -92,19 +132,21 @@ I (…) token_monitor: connected.
 I (…) token_monitor: stage 5: GET http://192.168.1.50:8734/usage
 I (…) token_monitor:   header | Content-Type: application/json
 I (…) token_monitor:   header | Content-Length: 278
-I (…) token_monitor: status 200, content-length 278, body 278 bytes
+I (…) token_monitor: status 200, content-length 279, body 279 bytes
 ---8<--- parsed ---8<---
-  5-hour :  12%   resets 17:10      (epoch 1788703799)
-  7-day  :   2%   resets Thu 19:00  (epoch 1789055999)
-  updated 12:29   stale: no
-  data age: 20s by the PC's clock
+  5-hour :  17%   resets 15:30      (epoch 1788784199)
+  7-day  :  10%   resets Thu 19:00  (epoch 1789055999)
+  updated 10:51   stale: no
+  data age: 68s by the PC's clock
 ---8<--- end ------8<---
-I (…) token_monitor: stage 7: rendered to the display
-I (…) token_monitor: stage 5 complete. heartbeat continues; power-cycle to re-run.
-I (…) token_monitor: still connected, rssi -62 dBm
+I (…) token_monitor: free heap 191868 bytes; next refresh in 45 s
+I (…) token_monitor: still connected, rssi -63 dBm
 ```
 
-Five things to actually check, not just glance at:
+…and then the same block again, 45 seconds later, for as long as it is
+powered.
+
+Six things to actually check, not just glance at:
 
 1. **The screen shows the readings, and shows them the right way round.**
    This is the only check here the serial log cannot make for you: SPI writes
@@ -149,9 +191,42 @@ Five things to actually check, not just glance at:
    right after the request means the HTTP task crashed — most likely a stack
    overflow, which prints a `***ERROR*** A stack overflow in task` panic just
    before the reboot.
+6. **`free heap` is flat across refreshes.** This is the first code in the
+   project that runs forever, and that changes which bugs matter: a leak of a
+   few hundred bytes per fetch is invisible in one request and fatal within a
+   day. Expect it to sit around 191–192 KB and stay there, wobbling by a few
+   hundred bytes as lwIP buffers come and go. A number that walks steadily
+   downward over successive refreshes is a leak, and the first suspects are a
+   missing `esp_http_client_cleanup` or a missing `cJSON_Delete`.
 
-The request runs **once**, at startup. Power-cycle or reset the board to run
-it again; stage 8 is what turns it into a repeating poll.
+The request now repeats **every 45 seconds**, forever. Note that the interval
+is measured from the end of the previous attempt, not the start — so a cycle
+that has to time out takes 55 seconds (45 + the 10-second HTTP timeout) rather
+than 45. That is intended: it paces retries against a dead service instead of
+letting them bunch up.
+
+### Exercising the failure states on purpose
+
+The interesting branches are the ones that are hard to catch by waiting, so
+`../pc_service/tools/` has two throwaway stand-ins that produce them on demand.
+Stop the real service first — both bind the same port, and the second to start
+fails loudly rather than sharing it.
+
+```
+python tools/stub_503.py            # the "no data yet" branch
+python tools/stub_stale.py 900      # 15 min old  -> amber STALE badge
+python tools/stub_stale.py 2400     # 40 min old  -> numbers go grey
+python tools/stub_stale.py 60 --flag  # fresh, but flagged stale by the PC
+```
+
+That last form is worth running at least once: the `stale` flag and the
+computed age are independent signals, and the flag alone has to be enough to
+raise the badge. Run them with the same `python.exe` the real service uses —
+the Windows firewall rule is per-program, so a different interpreter is
+silently blocked and the chip sees a timeout instead of a reply.
+
+For `NO LINK`, just stop the service and watch: the numbers stay, the banner
+appears within about a minute, and both clear on their own when it comes back.
 
 ## The font (`tools/make_font.py`)
 
@@ -173,8 +248,8 @@ text problem looks like a text problem rather than a gap.
 A **503** is a normal answer, not a failure of the firmware: it means
 `pc_service` is up but has never completed a poll (just started, or being
 rate-limited upstream), so it has no data to serve even as stale. The
-firmware logs the reason and carries on; from stage 7 this becomes a "no
-data" screen.
+firmware logs the reason and carries on; on screen it is a `NO DATA` banner
+over the last known numbers, or a `NO DATA` screen if there are none yet.
 
 ## Troubleshooting
 
@@ -183,7 +258,7 @@ data" screen.
 | Screen completely dark, no backlight glow | Power, not signal — check GND/VCC against the board's silkscreen first. The backlight is tied straight to VCC with no control pin, so a power fault is *total* darkness, and the serial log stays clean regardless |
 | Screen lit but colours wrong or inverted | Calibration, not wiring: the BGR bit (`0x08`) of `madctl` in `gc9a01.c`, or the inversion command `0x21` |
 | Text mirrored, upside down, or rotated | Also `madctl`, but the scan-direction bits rather than colour: `0x40` MX flips horizontally, `0x80` MY vertically, `0x20` MV rotates 90°. Solid-colour tests cannot reveal this — only asymmetric content can |
-| Screen lit but streaky, noisy, or partial | Signal integrity — most likely the 10 MHz SPI clock over long jumper wires, or a loose SCL/SDA/DC line |
+| Screen lit but streaky, noisy, or partial | Signal integrity — most likely the 40 MHz SPI clock over long jumper wires, or a loose SCL/SDA/DC line. `SPI_CLOCK_HZ` in `gc9a01.c` was 10 MHz through stage 7 and is the first thing to put back |
 | Build error naming `secrets.h` | You haven't copied `secrets.h.example` to `secrets.h` yet |
 | `disconnected (reason 201)` repeating | AP not found — wrong SSID, or the network is 5 GHz only |
 | `disconnected (reason 15)` or `(reason 2)` | Handshake failed — wrong password. A few `reason 2` retries *at startup* are normal and recover on their own |
@@ -196,7 +271,10 @@ data" screen.
 | `five_hour_pct/seven_day_pct are missing` | The two sides disagree about the contract — change both together, per `../ARCHITECTURE.md` |
 | `pc_service has no data yet (503)` | Expected right after starting the service, or while it is rate-limited upstream. Check `pc_service`'s own log |
 | `(TRUNCATED at BODY_CAP)` | The reply outgrew the 4 KB buffer, so it is deliberately not parsed — a partial document is a broken one |
-| Panic naming a stack overflow in `usage_fetch` | The 8 KB task stack was reduced; put it back |
+| Panic naming a stack overflow in `usage` | The 8 KB task stack was reduced; put it back |
+| `free heap` falling a little more on every refresh | A leak on the once-a-request path — suspect a missing `esp_http_client_cleanup` or `cJSON_Delete` |
+| Screen flashes black on every refresh | The partial-redraw model is being bypassed — something is calling `gc9a01_fill_screen` or forcing a screen-mode change each cycle |
+| Screen frozen while the serial log keeps refreshing | Drawing happens on one task by convention, with nothing enforcing it. A second task touching `gc9a01` is the thing to look for |
 | `Failed to connect … No serial data received` while flashing | Auto-reset into download mode did not take. Hold `B`, tap `R`, release `B`, then flash |
 | Boots to `boot:0x0 (USB_BOOT)` and `wait usb download` | Still in download mode after a manual `B`+`R` flash. Tap `R` alone — do not hold `B` — to boot the app |
 
@@ -207,9 +285,17 @@ Registry dependency, nothing to download. The init sequence and
 `madctl = 0x48` are confirmed correct on this panel. See
 `../ARCHITECTURE.md` for the pinout and the reasoning.
 
-The interface is two functions wide on purpose (`gc9a01_init`,
-`gc9a01_fill_screen`); stage 7 adds rectangle fills and text on top of the
-same address-window mechanism.
+The interface stayed two functions wide (`gc9a01_init`, `gc9a01_fill_screen`)
+for as long as that was all stage 6 needed; stage 7 added rectangle fills and
+text on top of the same address-window mechanism, and stage 8 leans on
+`gc9a01_fill_rect` for the partial redraws that keep a once-a-minute refresh
+from flashing.
+
+The SPI clock is **40 MHz**, raised from 10 at stage 8 once the screen was
+known-good — deliberately on its own, so that a failure would have one suspect
+rather than two. If the panel ever goes streaky after a rewiring, put
+`SPI_CLOCK_HZ` back to 10 MHz first: long jumper wires are the usual reason a
+display that works at 10 does not work at 40.
 
 **The panel self-test**, in the first two and a half seconds after reset:
 
@@ -236,9 +322,12 @@ is blind to, not only what it covers.
 
 Through stage 6 the cycle ended on solid blue, because a black screen and a
 *dead* screen look identical and the resting state had to carry the proof.
-Stage 7 ends on `CONNECTING` instead — still black, but with text on it, which
-makes the same point while saying something true about what the device is
-doing during the WiFi join.
+From stage 7 it ends on `CONNECTING` instead — still black, but with text on
+it, which makes the same point while saying something true about what the
+device is doing during the WiFi join. Stage 8 keeps `CONNECTING` for exactly
+as long as the chip has never associated; after that a lost link says
+`NO WIFI`, because those are different situations and only one of them is a
+normal boot.
 
 The display is initialized **before** WiFi starts: the panel does not need the
 network, the screen lights within a third of a second instead of after a

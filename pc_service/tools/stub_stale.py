@@ -17,9 +17,20 @@ stalled service.
     python tools/stub_stale.py 2400    # 40 min old -> numbers go grey
     python tools/stub_stale.py 60 --flag   # fresh, but flagged stale by the PC
 
-The last form is worth knowing about: the `stale` flag and the age are
+That last form is worth knowing about: the `stale` flag and the age are
 independent signals, and the flag alone has to be enough to raise the badge --
 that is the case where pc_service is alive and its own upstream call failed.
+
+The percentages are settable too, which is the only practical way to see the
+readings the real account will not conveniently produce on demand:
+
+    python tools/stub_stale.py 60 --five 100 --seven 100   # both gauges full
+    python tools/stub_stale.py 60 --five 0   --seven 0     # both empty
+
+100% is worth checking deliberately rather than waiting for: it is the exact
+180-degree cap in gc9a01_fill_arc, where the wedge test stops describing a
+wedge, so it is the input most likely to render wrong. Both at 100 also proves
+the two arcs meet at nine and three and close the ring without overlapping.
 
 Run it with the same python.exe pc_service uses -- the Windows firewall rule
 is per-program, so a different interpreter is silently blocked and the chip
@@ -65,6 +76,10 @@ parser.add_argument("age", type=int, nargs="?", default=900,
 parser.add_argument("--flag", action="store_true",
                     help="also set the stale flag, as pc_service does when its "
                          "own upstream call fails")
+parser.add_argument("--five", type=int, default=73,
+                    help="the 5-hour percentage to serve (default 73)")
+parser.add_argument("--seven", type=int, default=88,
+                    help="the 7-day percentage to serve (default 88)")
 args = parser.parse_args()
 
 
@@ -76,15 +91,17 @@ class Stub(BaseHTTPRequestHandler):
         now = int(time.time())
         updated = now - args.age
 
-        # Percentages high enough to be colour-banded amber/red when fresh, so
-        # the grey-out at 30 minutes is unmistakable rather than a subtle shift
-        # away from a colour that was already dull.
+        # The defaults are high enough to be colour-banded amber and red when
+        # fresh, so the grey-out at 30 minutes is unmistakable rather than a
+        # subtle shift away from a colour that was already dull. Override them
+        # to reach a specific reading -- 0 and 100 in particular, which the
+        # real account will not produce to order.
         body = json.dumps({
-            "five_hour_pct": 73,
+            "five_hour_pct": args.five,
             "five_hour_resets_at": time.strftime("%H:%M",
                                                  time.localtime(now + 3600)),
             "five_hour_resets_epoch": now + 3600,
-            "seven_day_pct": 88,
+            "seven_day_pct": args.seven,
             "seven_day_resets_at": time.strftime("%a %H:%M",
                                                  time.localtime(now + 86400)),
             "seven_day_resets_epoch": now + 86400,
@@ -105,6 +122,6 @@ class Stub(BaseHTTPRequestHandler):
         print("stub: " + (fmt % args_), flush=True)
 
 
-print("serving %ds-old data on 0.0.0.0:8734 (stale flag: %s)"
-      % (args.age, args.flag), flush=True)
+print("serving 5h %d%% / 7d %d%%, %ds old, on 0.0.0.0:8734 (stale flag: %s)"
+      % (args.five, args.seven, args.age, args.flag), flush=True)
 StubServer(("0.0.0.0", 8734), Stub).serve_forever()

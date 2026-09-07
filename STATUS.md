@@ -484,14 +484,25 @@ independent, and the age half works on its own.
 **All six visual checks are now done.** Nothing on stage 8's display
 behaviour rests on inference.
 
-The gauge arcs added later are a separate matter and are verified only in
-part — see their own section below. Confirmed on the panel: the first paint,
-the 6-pixel thickness, and both arcs in the right halves with the right
-colours. Confirmed after the full-width-clear fix: that an update no longer
-breaks the ring. **Not yet seen: the shrink path** — every observation so far
-has been of a rising percentage, so erasing a wedge back to background is
-exercised by code review and not by eye. The 5-hour window falling as earlier
-spend ages out of it is the natural way to catch it.
+The gauge arcs added later were verified the same way, and are now complete
+too. Confirmed on the panel: the first paint, the 6-pixel thickness, both arcs
+in the right halves with the right colours, and that an update no longer breaks
+the ring after the full-width-clear fix.
+
+The two hard cases were then forced with `stub_stale.py` rather than waited
+for, and both passed:
+
+- **100%**, the exact 180° cap in `gc9a01_fill_arc`. Confirmed twice: once from
+  a stub, and once from real data when the account genuinely reached 100%. The
+  half closes cleanly with no inversion and no spill past nine or three. Both
+  gauges at 100% together close the full ring, meeting at nine and three
+  without overlapping — which is the claim that the two halves tile the circle.
+- **The shrink path**, taking both gauges from 100% straight to 0%. The entire
+  ring is erased in one update, with no surviving fragments, and the numbers
+  re-band to green. This also exercises the full-repaint branch rather than the
+  delta one, since 100% → 0% crosses two colour bands.
+
+Nothing about the display now rests on inference.
 
 ### New tool: `pc_service/tools/stub_stale.py`
 
@@ -725,6 +736,49 @@ Two things worth generalising from it:
   reason written between them, because the failure mode is someone widening a
   clear later and reintroducing exactly this.
 
+## The 93-minute soak
+
+Run 13:59–15:32 with the serial port logged to a file with wall-clock
+timestamps, which is the only way to line the chip's own millisecond stamps up
+against pc_service's log and against the window reset.
+
+**Health: clean.** 71 successful fetches; free heap between 190,312 and 192,344
+bytes with first 191,980 and last 192,220 — flat across successful fetches,
+failed fetches, a full disconnect/reconnect cycle and a service outage. No
+panics, no reboots. The single `rst:0x` in the log is `USB_UART_CHIP_RESET` at
+the moment the logger opened the port, which is expected rather than a fault.
+That is the closest this build has come to answering the "flat over four
+minutes is not flat over four days" caveat.
+
+**Three failures, none of them firmware bugs, and each one instructive.**
+
+*A real WiFi collapse, unplanned.* RSSI fell from a steady -65 dBm to -87 over
+about two minutes, producing three `ESP_ERR_HTTP_EAGAIN` timeouts and then
+fourteen disconnects (reason 201) as association was lost entirely. The backoff
+behaved exactly as designed — 5s tier, then 30s tier — and it reassociated
+unattended with no intervention. Signal later recovered to -63 dBm on its own.
+
+This exposed a genuine limitation worth fixing one day: **the `NO WIFI` /
+`NO LINK` split keys off association, not usability.** A link that is
+associated but too weak to carry data keeps `WIFI_CONNECTED_BIT` set, so the
+chip reports `NO LINK` and the log sends you to debug the PC — the wrong
+machine. The RSSI is already being read in the heartbeat ten seconds later;
+including it in that diagnostic would have said "wifi is up but at -87 dBm"
+and pointed straight at the antenna.
+
+*The PC's address moved, live.* During the same disturbance DHCP reassigned the
+PC from .88 to .87, and every fetch failed with `ESP_ERR_HTTP_CONNECT` while
+WiFi was perfectly healthy. This is the exact failure the docs predicted would
+be the mystery one months later, and the firmware's own error message named the
+cause correctly — third in its list of suspects. **A DHCP reservation is no
+longer a nice-to-have.**
+
+*The window reset fired* at 15:31:23: 5h 100% → 0%, and `resets_at` came back
+as `None` — the contract's documented null case occurring naturally in the
+wild, rendered as `--`. The chip-side shrink was not captured because fixing
+the address required a reflash, which reboots; the shrink was reproduced
+deliberately with the stub instead.
+
 ## Facts established so far (don't re-derive)
 
 - **Token lives at** `~/.claude/.credentials.json`, key `claudeAiOauth.accessToken`.
@@ -809,6 +863,22 @@ Two things worth generalising from it:
   moved from y=205 to y=202 at stage 8 for exactly three pixels of headroom:
   at 205 the budget is eleven characters and `"BAD DATA 12M"` is twelve.
   `BANNER_MAX_CHARS` records the budget so it does not have to be rediscovered.
+- **A hostname in `secrets.h` does not work on this network, and it was
+  tested.** The chip fails with esp-tls error `32769`
+  (`CANNOT_RESOLVE_HOSTNAME`) — it never gets an address at all. The router
+  *does* resolve the bare name correctly when queried directly, so the name is
+  fine; the likeliest cause is that the chip's DHCP-supplied DNS server is not
+  the router but a public resolver, which knows nothing of LAN names. No
+  suffixed form (`.lan`, `.home`, `.local`, …) resolves either. Beware
+  `Resolve-DnsName` without `-DnsOnly -NoHostsFile`: it answers from Windows'
+  own local resolution and will tell you the name works when it does not.
+- **If the host PC ever moves from cable to WiFi, check AP isolation first.**
+  Today the chip is wireless and the PC is wired, so traffic crosses the
+  router's bridge. Wireless-to-wireless is the case client isolation blocks,
+  and no firewall rule or address fix works around it. Test with a phone on the
+  same WiFi hitting `http://<pc-ip>:8734/usage`. A DHCP reservation still works
+  over WiFi, but it is keyed on the **WiFi adapter's MAC**, which is a
+  different MAC from the Ethernet one — reserve the interface actually in use.
 - **Text on this panel is fitted to `CONTENT_R`, not the panel edge.** The
   gauge ring owns the rim, so anything that is not the ring — glyphs, the
   opaque background behind them, and every row clear — must stay inside that
@@ -1045,10 +1115,6 @@ degrades visibly rather than silently when the service or the network drops.
 
 So there is no next stage — only candidates, none of them required:
 
-- **Watch the 5-hour percentage fall, and check the arc shrinks cleanly.**
-  The only part of the arc code never exercised by eye: every change observed
-  so far has been upward. It costs nothing but patience, since the window rolls
-  on its own.
 - **The expressive face.** Deferred since stage 6 with the condition "revisit
   once the display works and the real free-flash number is known". Both are now
   true: the display works, and about **68 KB** remains (`0x110b0`, 7% of the
@@ -1057,9 +1123,11 @@ So there is no next stage — only candidates, none of them required:
   the band is now built and working — so what is left to decide is whether an
   expressive character adds anything on top. Worth answering before building.
   See the deferred list below.
-- **A DHCP reservation for the PC**, so `PC_SERVICE_HOST` in `secrets.h` stops
-  being a thing that can silently rot. This is a router change, not a code one,
-  and it is the single most likely cause of a mystery failure weeks from now.
+- **A DHCP reservation for the PC. This is now the top item, not a
+  precaution.** DHCP moved the PC from .88 to .87 during the soak and broke the
+  link exactly as predicted. Putting a hostname in `secrets.h` instead was
+  tested and does not work here — see the facts below. A reservation is a
+  router change, not a code one, and it is the only zero-code fix left.
 - **Starting `pc_service` automatically** on login or as a service. It is
   started by hand today, which is fine while the project is being worked on and
   is the main reason the screen says `NO LINK` between sessions.

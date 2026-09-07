@@ -426,6 +426,27 @@ mirrored, which is precisely how stage 7's bug survived six stages. The visual
 check is a human one, and it is the only check in this stage that a machine
 cannot make.
 
+**Since confirmed by eye, and the partial redraw is the part that needed it.**
+Watched live across a 65% → 66% change: the digit changed with no flash, no
+flicker on the surrounding lines, and no disturbance to the 7-day block.
+
+Worth recording precisely what that demonstrates, because the observation is
+easy to over-read. The reported impression was "only the 5 changed to 6", but
+the model works at *row* level, not digit level: the whole "66%" string was
+repainted, and the leading 6 simply landed in the same pixels as the old one,
+which is indistinguishable from not touching it. The 7-day rows wrote genuinely
+zero pixels, because nothing about them differed. There is also a real black
+clear of the changed row band before the text goes down — 240x35 at scale 5,
+about 3.4 ms at 40 MHz — and it was not perceptible, which is exactly why the
+row is the right unit. Stage 7 would have blanked all 240x240 and redrawn seven
+lines for that one digit.
+
+Getting a changed value to observe at all meant deliberately spending tokens
+against the account until the 5-hour window moved, which turned out to be the
+only practical way to exercise this on demand: across most polls the served
+numbers are byte-identical (see the 120s note in the deferred list), so the
+interesting path never runs by itself.
+
 ### New tool: `pc_service/tools/stub_stale.py`
 
 A companion to the existing `stub_503.py`, and for the same reason: the
@@ -882,6 +903,16 @@ So there is no next stage — only candidates, none of them required:
   Nothing suggests a problem — the heap is flat and the failure paths recover
   — but "flat over four minutes" and "flat over four days" are different
   claims, and only one of them has been made.
+- **Skipping the row clear when the new text covers the old.** `set_slot`
+  always clears the full row band before drawing, because a shorter centred
+  string would otherwise leave the tail of a longer one beside it. When the two
+  strings are the same length — which is the common case, "65%" to "66%" — the
+  clear is unnecessary: `gc9a01_draw_text` paints an opaque background, so it
+  overwrites in place. Skipping it would remove the ~3.4 ms blank entirely.
+  Deliberately not done: that blank is already imperceptible (confirmed by eye),
+  so this would add a special case to optimise something nobody can see, and
+  the failure mode if the condition is ever wrong is a stranded fragment on
+  screen — exactly the class of bug this project keeps trying to design out.
 
 `pc_service` must be **running** for any firmware work.
 

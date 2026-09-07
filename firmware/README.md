@@ -124,12 +124,11 @@ I (…) token_monitor:   fill: RED
 I (…) token_monitor:   fill: GREEN
 I (…) token_monitor:   fill: BLUE
 I (…) token_monitor: display ready
-I (…) token_monitor: stage 5: wifi + one fetch of the real usage JSON
+I (…) token_monitor: stage 8: wifi, then refresh every 45 s forever
 I (…) token_monitor: wifi started, connecting to "…"...
 I (…) token_monitor: got IP: 192.168.1.42
 I (…) token_monitor: netmask: 255.255.255.0, gateway: 192.168.1.1
-I (…) token_monitor: connected.
-I (…) token_monitor: stage 5: GET http://192.168.1.50:8734/usage
+I (…) token_monitor: polling http://192.168.1.50:8734/usage every 45 s
 I (…) token_monitor:   header | Content-Type: application/json
 I (…) token_monitor:   header | Content-Length: 278
 I (…) token_monitor: status 200, content-length 279, body 279 bytes
@@ -144,7 +143,10 @@ I (…) token_monitor: still connected, rssi -63 dBm
 ```
 
 …and then the same block again, 45 seconds later, for as long as it is
-powered.
+powered — everything from the `header` lines down. The banner above them is
+printed once: the `polling …` line in particular is the one to read carefully
+if the chip cannot reach the service, since it spells out exactly what address
+`secrets.h` sent it to.
 
 Six things to actually check, not just glance at:
 

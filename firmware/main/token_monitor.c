@@ -1271,6 +1271,14 @@ static void usage_task(void *arg)
      * which we just went to some trouble to leave room in. */
     static char storage[BODY_CAP];
 
+    /* Printed once, not once a cycle. The URL is the most useful line in this
+     * whole log when the chip cannot reach the service: it is assembled from
+     * secrets.h, so seeing it spelled out is how a PC_SERVICE_HOST that DHCP
+     * has moved out from under you gets caught in seconds rather than after an
+     * hour of blaming the firewall. Repeating it every 45 seconds would bury
+     * the lines that only appear when something is actually wrong. */
+    ESP_LOGI(TAG, "polling %s every %d s", USAGE_URL, REFRESH_INTERVAL_MS / 1000);
+
     while (1) {
 
         /* Ask the radio before spending a ten-second HTTP timeout discovering

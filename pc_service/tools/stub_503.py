@@ -39,8 +39,6 @@ class StubServer(ThreadingHTTPServer):
     allow_reuse_address = sys.platform != "win32"
 
 
-
-
 class Stub(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 30                # never wait forever on a parked keep-alive

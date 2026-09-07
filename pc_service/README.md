@@ -97,6 +97,60 @@ normally are. Guest WiFi networks, mesh systems in certain modes, and
 "client isolation" / "AP isolation" settings deliberately break this, and no
 firewall rule fixes it.
 
+## Keeping the address stable
+
+The firmware finds this service through `PC_SERVICE_HOST` in
+`firmware/main/secrets.h`, and on most home networks that address is
+DHCP-assigned — so it can change with no warning and no obvious cause. That is
+not a hypothetical: it happened during testing, mid-session. The router
+reassigned the PC by one digit, every fetch began failing with
+`ESP_ERR_HTTP_CONNECT`, and WiFi was perfectly healthy throughout. The symptom
+points at the service or the firewall; the cause was neither.
+
+**The fix is a DHCP reservation** — a router setting that pins one address to
+one device permanently. No code, no rebuild, and it holds across reboots on
+both sides. Two details decide whether it actually works:
+
+- **Reservations are keyed on MAC address**, and a PC's WiFi adapter has a
+  *different* MAC from its Ethernet adapter. Reserve the interface the machine
+  will actually be using. If it might use either, reserve both — they will get
+  different addresses, and `secrets.h` has to name the one in use.
+- **The medium is irrelevant to the router**, so this works the same for a
+  wired or a wireless host.
+
+**Why not a hostname instead?** It was tried, and it does not work on the
+network this was built on: the chip fails with esp-tls error `32769`,
+`CANNOT_RESOLVE_HOSTNAME` — it never gets an address at all. The router
+resolves the name correctly when queried directly, so the name is fine; the
+likeliest cause is that the chip's DHCP-supplied DNS server is not the router
+but a public resolver, which knows nothing of LAN names. No suffixed form
+(`.lan`, `.home`, `.local`) resolved either. It may well work on a router that
+hands out itself as the resolver, so it is worth one test before doing the
+reservation work — but test it *from the chip*, not from the PC. Windows'
+`Resolve-DnsName` answers from its own local resolution unless you pass
+`-DnsOnly -NoHostsFile`, and will cheerfully tell you the name works when the
+chip cannot resolve it at all.
+
+## Moving the service to a different PC
+
+Five things change, and the first is the one people forget:
+
+1. **Claude Code must be installed and logged in on the new machine.** This
+   service reads the OAuth token from Claude Code's own credential file on the
+   host — no Claude Code, no token, no data. See the platform table above for
+   where that file lives.
+2. **The address changes.** Update `PC_SERVICE_HOST` in `secrets.h`, rebuild
+   and reflash.
+3. **The firewall rule does not come with you.** It is per-program on Windows,
+   so the new machine needs its own rule for its own `python.exe` — or a port
+   rule, which survives interpreter changes.
+4. **Check the subnet**, and if the new host is on WiFi rather than cable,
+   check AP isolation before anything else. Chip and host both being wireless
+   is exactly the case client isolation blocks, and nothing in software works
+   around it. A phone on the same WiFi loading
+   `http://<new-pc-ip>:8734/usage` is the quickest test.
+5. **Reserve the new address** once it works, per the section above.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

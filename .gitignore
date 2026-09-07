@@ -9,9 +9,17 @@ firmware/managed_components/
 firmware/dependencies.lock
 
 # Python
-pc_service/__pycache__/
-pc_service/*.pyc
+__pycache__/
+*.pyc
 pc_service/.venv/
+
+# Logs and scratch output. Nothing in this project writes into the repo by
+# design -- session logs and serial captures belong outside it -- but a stray
+# capture is easy to make and easy to commit by accident, and a serial log can
+# quietly contain a real LAN address. See SECRETS.md.
+*.log
+*.tmp
+soak/
 
 # Local machine config — not secret, but machine-specific (absolute toolchain
 # paths, local username, COM port) and useless to anyone else.

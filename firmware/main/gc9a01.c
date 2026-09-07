@@ -3,10 +3,11 @@
  *
  * Ported unchanged in every way that touches the panel from the standalone
  * bring-up test that proved this wiring and this init sequence on hardware.
- * That is deliberate: the timings, the register table and the 10 MHz clock
- * are all *known good* on this exact board, so stage 6 changes only the
- * surroundings (a real project, with a WiFi radio running alongside). If the
- * screen stays dark now, the difference is the environment, not the driver.
+ * That is deliberate: the timings and the register table are *known good* on
+ * this exact board, so stage 6 changed only the surroundings (a real project,
+ * with a WiFi radio running alongside). If the screen stays dark, the
+ * difference is the environment, not the driver. The one number since changed
+ * on purpose is the SPI clock -- see the note on SPI_CLOCK_HZ below.
  *
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED:
@@ -88,13 +89,18 @@ static const char *TAG = "gc9a01";
  * the only device on the bus. */
 #define PIN_CS   GPIO_NUM_8   /* D8 -- CS; see the strapping note above */
 
-/* Conservative, and deliberately not raised yet. Many GC9A01 boards run
- * happily at 40 MHz, and stage 7 will want the extra speed once it is redrawing
- * regions -- but 10 MHz is the number this panel was *proven* at over jumper
- * wires, and changing it in the same step as moving the driver into a new
- * project would give a failure two suspects instead of one. Raise it later, on
- * its own, with the screen already working. */
-#define SPI_CLOCK_HZ (10 * 1000 * 1000)
+/* Raised from 10 MHz to 40 MHz at stage 8, which is what the earlier version
+ * of this comment said to do: on its own, with the screen already working, so
+ * a failure has one suspect rather than two. 10 MHz was the number this panel
+ * was *proven* at over jumper wires during bring-up; 40 MHz is what most
+ * GC9A01 boards are specified for, and it is what makes stage 8's partial
+ * redraws cheap enough to be invisible.
+ *
+ * If the screen ever shows torn rows, snow, or wrong colours after a wiring
+ * change, put this back to 10 MHz first -- long jumper wires are the usual
+ * reason a panel that works at 10 does not work at 40, and it is one edit to
+ * rule out. */
+#define SPI_CLOCK_HZ (40 * 1000 * 1000)
 
 static spi_device_handle_t s_spi;
 

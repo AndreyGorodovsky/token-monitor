@@ -456,9 +456,31 @@ how the mirroring survived to stage 7. The digits prove orientation (a mirrored
 they cover both halves of `madctl = 0x48` with tests actually capable of
 exposing a fault in each.
 
-That leaves one item on the visual list unseen: the failure banners on the
-glass. Every one of them has been exercised through the serial log and the
-stubs, so what is unconfirmed is the rendering, not the logic.
+**The failure banners were then confirmed on the glass too, completing the
+list.** Three states, watched live:
+
+- **`NO LINK`.** The real service was stopped. The banner appeared within a
+  cycle with the numbers untouched above it, and the age incremented on the
+  following cycle while nothing else on screen moved. Restarting the service
+  cleared the banner unattended; the recovery landed 24 s later, because the
+  chip's 45 s cycle happened to fall there. The 503 window on restart was one
+  second wide and the chip did not land in it, so `NO DATA` never appeared --
+  correct, if slightly disappointing.
+- **The two staleness tiers**, using `stub_stale.py`, and the method is worth
+  keeping because it is what made the result unambiguous. Rather than showing
+  the stale state alone, the *same payload* was served twice with only its age
+  changed: at 60 s, 73% drew amber and 88% drew red with no banner; at 2400 s,
+  the identical digits drew flat grey under a red `STALE 40M`. Every visible
+  difference is therefore attributable to the age and to nothing else.
+
+One detail from that run is a better proof than it looks: the stub reported
+`stale flag: False` both times. So the badge and the grey-out were driven
+purely by the chip's own `now_epoch - updated_epoch` arithmetic, with the
+service making no claim of staleness at all. The two signals really are
+independent, and the age half works on its own.
+
+**All six visual checks are now done.** Nothing on the display's behaviour
+rests on inference any more.
 
 ### New tool: `pc_service/tools/stub_stale.py`
 

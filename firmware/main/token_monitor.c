@@ -33,8 +33,8 @@
  *
  * Success looks like: a colour cycle, "CONNECTING", then both percentages with
  * their reset times, updating quietly every 45 seconds. pc_service must be
- * RUNNING on the PC named by PC_SERVICE_HOST in secrets.h -- otherwise the
- * screen says NO LINK, which is itself the correct behaviour.
+ * RUNNING on the PC this chip is configured to poll (see config.h) --
+ * otherwise the screen says NO LINK, which is itself the correct behaviour.
  *
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED, top to bottom:
@@ -66,16 +66,10 @@
  * ---------------------------------------------------------------------------
  */
 
-/* Fail with a sentence you can act on, rather than the compiler's
- * "secrets.h: No such file or directory" pointing at an #include line.
- * __has_include is a compiler feature test; the outer #if defined() guard is
- * because it isn't universally available, though GCC (what ESP-IDF uses) has
- * had it for years. */
-#if defined(__has_include)
-#  if !__has_include("secrets.h")
-#    error "main/secrets.h is missing -- copy main/secrets.h.example to main/secrets.h and fill in your WiFi details. See SECRETS.md."
-#  endif
-#endif
+/* secrets.h used to be required here, with a hard #error if it was missing.
+ * It is now optional, and the check moved to config.c: NVS can supply every
+ * value on its own, and secrets.h -- when present -- supplies the defaults.
+ * See config.h for the whole arrangement. */
 
 #include <stdio.h>                   /* printf, and snprintf for the safe
                                       * bounded string copies in the parser  */
@@ -110,7 +104,8 @@
 #include "gc9a01.h"                  /* stage 6: the round display driver,
                                       * hand-rolled on spi_master + gpio    */
 
-#include "secrets.h"                 /* YOUR values -- gitignored           */
+#include "config.h"                  /* the four runtime values: NVS first,
+                                      * secrets.h as the fallback           */
 
 /* Every log line we emit is prefixed with this, so our messages stay
  * greppable among the much noisier driver output ("wifi:", "esp_netif_
@@ -128,6 +123,12 @@ static const char *TAG = "token_monitor";
  * We use exactly one bit. BIT0 is just the value 1; a second independent flag
  * would be BIT1, then BIT2, and so on. */
 static EventGroupHandle_t s_wifi_events;
+
+/* The configuration this run is using: WiFi credentials, and where pc_service
+ * lives. Filled once by config_load() at the top of app_main, before anything
+ * else reads it, and never written again -- which is what makes it safe for
+ * the event handlers and usage_task to read without a lock. */
+static app_config_t s_cfg;
 #define WIFI_CONNECTED_BIT BIT0
 
 /* Reconnect attempts since the last success. Only used for logging at this
@@ -244,7 +245,7 @@ static void reconnect_timer_cb(void *arg)
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "wifi started, connecting to \"%s\"...", WIFI_SSID);
+        ESP_LOGI(TAG, "wifi started, connecting to \"%s\"...", s_cfg.ssid);
         esp_wifi_connect();
         return;
     }
@@ -320,25 +321,25 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 /* --- stage 5: fetching and parsing the usage JSON ------------------------ */
 
-/* The URL is assembled from secrets.h rather than written out here, because
- * the host part is a real LAN address -- machine-specific, and this file is
- * committed to a public repo. secrets.h is gitignored; see SECRETS.md.
+/* The URL pc_service is polled at, assembled once at startup.
  *
- * The two-step STRINGIFY is a standard C preprocessor idiom, and it is worth
- * understanding rather than copying. The `#` operator turns a macro argument
- * into a string literal, but it does so *before* that argument is itself
- * expanded. So a one-step version of this would produce the literal text
- * "PC_SERVICE_PORT" instead of "8734". Passing it through an outer macro
- * first forces the expansion to happen, and only the inner macro stringifies.
+ * This used to be a compile-time constant -- "http://" PC_SERVICE_HOST ":"
+ * STRINGIFY(PC_SERVICE_PORT) "/usage", three macros pasted together by the
+ * preprocessor into a single string literal. That was genuinely the nicer
+ * arrangement: no snprintf, no buffer, nothing to get wrong at runtime. It is
+ * the price of being able to change the service address without a rebuild.
+ * The host and port simply are not known until config_load() has run, so the
+ * string cannot exist before then.
  *
- * Adjacent string literals are concatenated by the compiler, so the result is
- * a single compile-time constant -- no sprintf, no buffer, nothing to get
- * wrong at runtime. Note pc_service serves plain HTTP: no TLS on the LAN, by
- * design (ARCHITECTURE.md's "trust boundary is the home network"), which is
- * also why stage 4 deliberately tested without it. */
-#define STRINGIFY_(x) #x
-#define STRINGIFY(x)  STRINGIFY_(x)
-#define USAGE_URL "http://" PC_SERVICE_HOST ":" STRINGIFY(PC_SERVICE_PORT) "/usage"
+ * 128 bytes is comfortable rather than tight: the longest value this can hold
+ * is "http://" (7) + a 63-character host + ":65535" (6) + "/usage" (6) + NUL,
+ * which is 83. snprintf truncates rather than overruns if that arithmetic is
+ * ever wrong.
+ *
+ * Note pc_service serves plain HTTP: no TLS on the LAN, by design
+ * (ARCHITECTURE.md's "trust boundary is the home network"), which is also why
+ * stage 4 deliberately tested without it. */
+static char s_usage_url[128];
 
 /* Where the response body accumulates.
  *
@@ -1310,7 +1311,7 @@ static void fetch_once(char *storage, int storage_cap)
      * this struct. .user_data is the pointer handed back to our event handler
      * -- it is how the handler knows where to append without a global. */
     esp_http_client_config_t cfg = {
-        .url           = USAGE_URL,
+        .url           = s_usage_url,
         .method        = HTTP_METHOD_GET,
         .event_handler = on_http_event,
         .user_data     = &body,
@@ -1375,13 +1376,13 @@ static void fetch_once(char *storage, int storage_cap)
         /* Stage 4 already proved this chip can resolve DNS and reach the
          * internet, and the loop below has already confirmed WiFi is up before
          * calling in here -- so a failure at this point is almost certainly on
-         * the PC side or in secrets.h. Worth saying, because the instinct is
-         * to blame WiFi. */
+         * the PC side or in the configured address. Worth saying, because the
+         * instinct is to blame WiFi. */
         ESP_LOGE(TAG, "wifi is up and stage 4 reached the internet from this "
                       "chip, so suspect: pc_service not running; the PC "
-                      "firewall blocking this port; or PC_SERVICE_HOST in "
-                      "secrets.h pointing at an address DHCP has since handed "
-                      "to something else");
+                      "firewall blocking this port; or the configured host "
+                      "(logged as \"polling ...\" at startup) pointing at an "
+                      "address DHCP has since handed to something else");
         show_failure("NO LINK", "NO LINK", "PC SERVICE");
 
     } else {
@@ -1477,11 +1478,12 @@ static void usage_task(void *arg)
 
     /* Printed once, not once a cycle. The URL is the most useful line in this
      * whole log when the chip cannot reach the service: it is assembled from
-     * secrets.h, so seeing it spelled out is how a PC_SERVICE_HOST that DHCP
-     * has moved out from under you gets caught in seconds rather than after an
-     * hour of blaming the firewall. Repeating it every 45 seconds would bury
-     * the lines that only appear when something is actually wrong. */
-    ESP_LOGI(TAG, "polling %s every %d s", USAGE_URL, REFRESH_INTERVAL_MS / 1000);
+     * whichever config won (NVS or secrets.h), so seeing it spelled out is how
+     * a host address that DHCP has moved out from under you gets caught in
+     * seconds rather than after an hour of blaming the firewall. Repeating it
+     * every 45 seconds would bury the lines that only appear when something is
+     * actually wrong. */
+    ESP_LOGI(TAG, "polling %s every %d s", s_usage_url, REFRESH_INTERVAL_MS / 1000);
 
     while (1) {
 
@@ -1540,7 +1542,7 @@ static void usage_task(void *arg)
  * long before there is a connection -- association and the DHCP lease arrive
  * later, on the event handlers above. Nothing here blocks waiting for a
  * network. */
-static void wifi_start(void)
+static void wifi_start(const app_config_t *cfg)
 {
     /* Four layers, bottom up. Each has to exist before the next one can:
      *   1. NVS        -- the WiFi driver stores calibration data here.
@@ -1590,27 +1592,40 @@ static void wifi_start(void)
      * copies below, and leaves every option we don't set at its default. */
     wifi_config_t wifi_cfg = { 0 };
 
-    /* Caught at build time rather than presenting as a runtime mystery.
-     * ssid is uint8_t[32] and password uint8_t[64]. The 802.11 SSID field is
-     * a length-counted array, not a C string, so a full 32 characters is
-     * legal and needs all 32 bytes. Copying with sizeof-1 would quietly drop
-     * the last character of a maximum-length SSID -- which surfaces as an
-     * endless "disconnected (reason 201)" loop, i.e. exactly the symptom the
-     * README tells you to blame on a typo or a 5 GHz network. Same shape for
-     * a 64-hex-character raw WPA2 PSK.
+    /* This used to be two _Static_asserts. They cannot survive the move to a
+     * runtime config -- the compiler no longer knows what the strings are --
+     * so the same rule is enforced here instead, and the reasoning is worth
+     * keeping either way.
      *
-     * sizeof(WIFI_SSID) - 1 is the string's length: WIFI_SSID is a literal,
-     * so sizeof counts its bytes including the terminating NUL, and the -1
-     * drops that. _Static_assert is evaluated by the compiler, so an
-     * over-long value in secrets.h fails the build with the message below
-     * rather than misbehaving on the desk. */
-    _Static_assert(sizeof(WIFI_SSID) - 1 <= 32,
-                   "WIFI_SSID in secrets.h is longer than the 32-character 802.11 limit");
-    _Static_assert(sizeof(WIFI_PASSWORD) - 1 <= 64,
-                   "WIFI_PASSWORD in secrets.h is longer than the 64-character limit");
+     * sta.ssid is uint8_t[32] and sta.password uint8_t[64]. The 802.11 SSID
+     * field is a length-counted array, not a C string, so a full 32 characters
+     * is legal and needs all 32 bytes; copying only 31 would quietly drop the
+     * last character of a maximum-length SSID, which surfaces as an endless
+     * "disconnected (reason 201)" loop -- exactly the symptom the README tells
+     * you to blame on a typo or a 5 GHz network. Same shape for a
+     * 64-hex-character raw WPA2 PSK.
+     *
+     * By construction these clamps cannot fire: config.h sizes its buffers at
+     * 32+1 and 64+1, so strlen can never exceed the destination. They are here
+     * because "cannot happen" is a property of today's config.h rather than of
+     * this function, and a silent buffer overrun is a bad way to discover that
+     * somebody changed one number. Truncating loudly is the safe failure. */
+    size_t ssid_len = strlen(cfg->ssid);
+    size_t pass_len = strlen(cfg->password);
 
-    memcpy(wifi_cfg.sta.ssid, WIFI_SSID, sizeof(WIFI_SSID) - 1);
-    memcpy(wifi_cfg.sta.password, WIFI_PASSWORD, sizeof(WIFI_PASSWORD) - 1);
+    if (ssid_len > sizeof(wifi_cfg.sta.ssid)) {
+        ESP_LOGE(TAG, "ssid is %u bytes, truncating to %u -- this will not connect",
+                 (unsigned)ssid_len, (unsigned)sizeof(wifi_cfg.sta.ssid));
+        ssid_len = sizeof(wifi_cfg.sta.ssid);
+    }
+    if (pass_len > sizeof(wifi_cfg.sta.password)) {
+        ESP_LOGE(TAG, "password is %u bytes, truncating to %u -- this will not connect",
+                 (unsigned)pass_len, (unsigned)sizeof(wifi_cfg.sta.password));
+        pass_len = sizeof(wifi_cfg.sta.password);
+    }
+
+    memcpy(wifi_cfg.sta.ssid,     cfg->ssid,     ssid_len);
+    memcpy(wifi_cfg.sta.password, cfg->password, pass_len);
 
     /* WIFI_AUTH_OPEN as a *threshold* does not mean "connect to open
      * networks" -- it means "do not require a minimum security level".
@@ -1658,6 +1673,36 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    /* --- the runtime configuration, before anything that could use it -----
+     *
+     * After nvs_flash_init, because config_load reads NVS; before the display
+     * and the radio, because both depend on what it finds. Nothing here draws
+     * or transmits -- it only decides what this run is going to try to do, and
+     * says so in the log before trying it.
+     *
+     * NOTE the interaction with the erase-and-retry just above: if NVS was
+     * full or written by a different IDF version, it has now been WIPED, and a
+     * provisioned config went with it. That is correct -- an unreadable NVS
+     * cannot be trusted to hold credentials either -- but it means the chip
+     * falls back to secrets.h, and once the setup portal exists it will mean
+     * the chip comes up asking to be configured again. */
+    config_load(&s_cfg);
+
+    /* Assembled once, here, because both the fetch task and its log lines want
+     * it and neither should rebuild it. See the comment above s_usage_url for
+     * what this replaced. */
+    snprintf(s_usage_url, sizeof(s_usage_url), "http://%s:%u/usage",
+             s_cfg.host, (unsigned)s_cfg.port);
+
+    if (!config_is_complete(&s_cfg)) {
+        /* No SSID, or nowhere to poll. There is nothing this stage can do
+         * about that -- the setup portal is what will fix it -- but saying so
+         * precisely beats letting it present as an endless "reason 201" WiFi
+         * failure, which sends you off to debug the wrong thing entirely. */
+        ESP_LOGE(TAG, "config incomplete: ssid, host and port must all be set");
+        ESP_LOGE(TAG, "fill in main/secrets.h and reflash, or provision over nvs");
+    }
+
     /* --- stage 6: the display, before anything network-shaped -------------
      *
      * Deliberately first. The panel does not depend on WiFi, and doing it here
@@ -1698,7 +1743,15 @@ void app_main(void)
      * saying it is better: the WiFi join below can take twenty seconds, and a
      * screen that sat blank or blue for that long would look broken. The
      * colour cycle just above still does the panel-is-alive job. */
-    render_message("CONNECTING", NULL);
+    /* CONNECTING is a promise that something is about to happen. With no
+     * usable config nothing is, so say that instead -- the brief's "degrade
+     * visibly, not silently" applies just as much to a chip that was never
+     * told where to go as to one that lost its network. */
+    if (config_is_complete(&s_cfg)) {
+        render_message("CONNECTING", NULL);
+    } else {
+        render_message("NO CONFIG", "SEE SERIAL");
+    }
     ESP_LOGI(TAG, "display ready");
 
     /* Must exist before wifi_start(), because the handlers it registers can
@@ -1707,7 +1760,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "stage 8: wifi, then refresh every %d s forever",
              REFRESH_INTERVAL_MS / 1000);
-    wifi_start();
+    wifi_start(&s_cfg);
 
     /* Stage 7 blocked here until WIFI_CONNECTED_BIT was set, and only then
      * created the fetch task. Stage 8 does not, and the change matters: the

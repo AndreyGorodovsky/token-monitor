@@ -11,8 +11,23 @@ check before the repository goes public.
 | What | Where it lives | Ever touches this repo? | Git status |
 |---|---|---|---|
 | Claude OAuth token | `~/.claude/.credentials.json` (`%USERPROFILE%\.claude\.credentials.json` on Windows), outside this project entirely | No — `pc_service` reads it at runtime from that external path on every poll, never copies it in | N/A, nothing to gitignore |
-| WiFi SSID + password | `firmware/main/secrets.h` | Yes, as a file in the firmware project | **gitignored** — only `secrets.h.example` (fake values) is committed |
-| PC service's LAN host/port | `firmware/main/secrets.h` (same file — it's "this machine's network config", not just WiFi) | Yes | **gitignored**, same as above |
+| WiFi SSID + password | `firmware/main/secrets.h`, **and/or** the chip's own NVS partition | Only the `secrets.h` half does | **gitignored** — only `secrets.h.example` (fake values) is committed. The NVS copy lives in flash on the chip and never touches the repo |
+| PC service's LAN host/port | `firmware/main/secrets.h` (same file — it's "this machine's network config", not just WiFi), **and/or** NVS | Only the `secrets.h` half does | **gitignored**, same as above |
+
+Since these four values moved to runtime configuration, `secrets.h` is
+**optional**: NVS can supply all of them, and the firmware builds and runs
+with no `secrets.h` present at all. When both have a value, NVS wins, per
+key. Two consequences worth stating plainly:
+
+- **NVS is not encrypted.** A WiFi password stored there is readable by
+  anyone who can plug the board into a USB port and dump its flash. This is
+  not a downgrade — a compiled-in `#define` was equally readable in the
+  binary — but it is now a second place the value exists, and moving the
+  gadget on to someone else means erasing it (`idf.py erase-flash`) rather
+  than just not handing over `secrets.h`.
+- **The repo is now clone-and-flash.** Because `secrets.h` is optional,
+  nothing about publishing this repository requires a reader to receive, or
+  invent, any credential to get a working build.
 
 Nothing else in this project should hold a real credential. If a future
 stage adds one (an API key, a different token, a password), add it to this

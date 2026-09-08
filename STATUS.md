@@ -4,10 +4,19 @@ A running log of what is done, what is verified, and what was learned the
 hard way. Read it with `CLAUDE.md` (the brief) and `ARCHITECTURE.md` (the
 design) to resume cold.
 
-**One-line status:** **complete.** All eight stages done and verified on
-hardware. The chip refreshes itself every 45s, recovers from a dropped network
-unattended, and degrades visibly when it cannot get fresh numbers. Two gauge
-arcs around the rim were added afterwards — see "The gauge arcs" below.
+**One-line status:** the original build is **complete** — all eight stages
+done and verified on hardware. The chip refreshes itself every 45s, recovers
+from a dropped network unattended, and degrades visibly when it cannot get
+fresh numbers. Two gauge arcs around the rim were added afterwards — see "The
+gauge arcs" below.
+
+**You are on the `wifi-provisioning` branch**, where a follow-on feature is
+half built: a button that puts the chip into a WiFi hotspot serving a setup
+form, so changing networks or PC address stops requiring an editor, a
+toolchain and a USB cable. Stages 1 and 2 of 5 are done and verified;
+**stage 3 is next**. See "WiFi provisioning" below, which is the section to
+read first when resuming on this branch. `main` is untouched and still holds
+the finished eight-stage build.
 
 ## Done and verified
 
@@ -36,6 +45,112 @@ working on hardware by a standalone solid-colour-fill test — raw
 Registry driver: the point of the `esp_lcd` route was to avoid *writing* a
 GC9A01 driver, and a working one now exists. Revisit that only if a concrete
 need shows up (DMA-backed double-buffering, LVGL).
+
+## WiFi provisioning (branch `wifi-provisioning`) — IN PROGRESS
+
+**The problem.** Changing WiFi networks, or the PC getting a different
+address, means editing `secrets.h` and rebuilding and reflashing. The goal is
+a button that puts the chip into its own WiFi hotspot serving a setup form,
+so the four settings can be changed from a phone in about ninety seconds.
+
+Five stages. **1 and 2 are done and verified on hardware; 3 is next.**
+
+| Stage | State |
+|---|---|
+| 0 — 1.5 MB app partition, to make room | **done** (`5d00904`) — free space ~68 KB → ~544 KB |
+| 1 — config read from NVS, secrets.h as fallback | **done** (`19811ee`) |
+| 2 — the button on D1, debounced, long-press detected | **done** (`1ec88e9`) |
+| review pass — six findings, all real | **done** (`5c800ef`) |
+| 3 — SoftAP + HTML form, submissions logged but NOT saved | **next** |
+| 4 — save to NVS, reboot to apply, empty config enters setup | not started |
+| 5 — polish: verify-before-commit, SSID scan dropdown, captive portal | not started |
+
+### Decisions already made — don't re-litigate these
+
+- **Nothing is deleted when setup mode is entered.** The original idea was
+  "wipe the credentials, then start the hotspot"; that was argued down. Old
+  config stays until new values are actually submitted, which is what makes a
+  timeout, an accidental press, and a plain reset all safe. It is the single
+  most important property of the design.
+- **Exit setup mode with a second 3-second long press** on the same button.
+  Chosen over the BOOT button, which is a strapping pin (held across a reset
+  it drops the chip into the bootloader) and a surface-mount button an
+  enclosure would hide. Exit and the 5-minute timeout share ONE code path,
+  both `esp_restart()`, so they cannot drift apart.
+- **The AP is password-protected**, with the network name, password and URL
+  drawn on the panel. Random per entry into setup mode, not derived from the
+  MAC — the MAC is broadcast, so a derived password would be guessable by
+  anyone in range. An open AP would let a neighbour repoint the gadget.
+- **No captive-portal DNS hijack in v1.** That trick exists because headless
+  devices cannot tell you the URL. This one has a screen, which is also what
+  makes the AP password practical. Add the DNS responder later only if typing
+  `192.168.4.1` proves annoying.
+- **Not IDF's `wifi_provisioning` manager.** It expects a companion phone app,
+  does not carry the extra `host`/`port` fields, and is heavier than one
+  `esp_http_server` handler serving one form.
+- **Per-key fallback, not all-or-nothing.** A value missing from NVS falls
+  back to `secrets.h` individually. A power cut part-way through a save then
+  leaves a working chip rather than a brick, and it made stage 1 testable on
+  its own.
+- **The button never draws.** `token_monitor.c` hands the panel to
+  `usage_task` and nothing else may touch `gc9a01`. The button sets an event
+  bit; `usage_task` decides what it looks like. This is why the event group
+  was renamed `s_wifi_events` → `s_events`: `usage_task` sometimes blocks
+  waiting for the radio, FreeRTOS cannot wait on two groups at once, and a
+  button in its own group would be ignored during exactly the situation where
+  you are most likely to press it.
+
+### What stage 3 does
+
+Long press → stop station mode, start SoftAP, start `esp_http_server`, serve
+one form at `192.168.4.1` pre-filled with the current SSID and host/port.
+Submitting **logs the values and saves nothing**; the write path is stage 4.
+Leave via the second long press or a 5-minute timeout, both `esp_restart()`.
+
+Three things it has to get right:
+
+- **Suppress the station reconnect logic while in setup mode.**
+  `on_wifi_event` treats every `STA_DISCONNECTED` as "ask again", with a
+  backoff timer. Stopping station mode to become an AP fires that event, so
+  without a flag the reconnect logic fights the mode switch.
+- **Never render the stored password back into the form.** Blank field,
+  "leave blank to keep current". Same discipline as never logging a token.
+- `esp_http_server` goes into `main/CMakeLists.txt`'s `REQUIRES`. That is
+  what the stage-0 partition bump was for.
+
+### Facts established on this branch (don't re-derive)
+
+- **ccache silently serves a stale object when `secrets.h` appears.** ESP-IDF
+  compiles through ccache, which keys its cache on the headers the *previous*
+  compile opened. Build once without `secrets.h` and creating it later
+  invalidates nothing. Two layers must be defeated together, and each obvious
+  single remedy fails: `CCACHE_RECACHE=1` alone does nothing because ninja
+  never invokes the compiler, and `idf.py fullclean` alone does nothing
+  because ccache returns the same stale object. Run `idf.py fullclean` then
+  `CCACHE_RECACHE=1 idf.py build`. Use RECACHE rather than `--no-ccache`,
+  which bypasses the poisoned entry and leaves it to be served again later.
+  Cost several confused rebuilds; documented in `config.c` and the firmware
+  README. The `config:` lines at boot are how you spot it.
+- **`sdkconfig.defaults` does not override an existing `sdkconfig`.** It
+  supplies defaults *underneath* it. On a tree already built once, the
+  partition change did nothing, silently. Delete `firmware/sdkconfig`.
+- **The PC moved back to `192.168.1.88`** while `secrets.h` still says `.87`.
+  The chip is currently pointed at `.88` **via a hand-flashed NVS image**, not
+  via `secrets.h` — so `idf.py erase-flash` would leave it pointing at the
+  wrong address. A router DHCP reservation remains the real fix.
+- **The button measures zero bounce** under effectively continuous polling.
+  Debounce is set at 3 agreeing samples (60 ms) as insurance, not as a fix.
+- **`vTaskDelay` under one tick does not sleep.** At the default 100 Hz,
+  `pdMS_TO_TICKS(5)` is 0, and `vTaskDelay(0)` yields instead of sleeping —
+  which starves the idle task until the watchdog fires. Found in the
+  standalone button test; `button.c` polls at 20 ms with a `_Static_assert`
+  guarding it.
+
+### Current chip state
+
+Flashed with the branch build. Config: SSID and password from `secrets.h`,
+host and port from NVS (`192.168.1.88:8734`). `pc_service` must be running on
+the PC or the screen says `NO LINK`, which is correct behaviour.
 
 ## Stage 4 as built
 
@@ -1108,12 +1223,19 @@ file hashes.
 
 ## Next session — start here
 
-**The build order is finished.** Every stage in `CLAUDE.md` is done and
-verified on hardware, and the definition of done is met: the chip shows both
-percentages and their reset times, refreshes itself every 45 seconds, and
-degrades visibly rather than silently when the service or the network drops.
+**On the `wifi-provisioning` branch, the next thing to build is stage 3 of
+the provisioning work** — see the "WiFi provisioning" section above for what
+that is and what has already been decided about it. Everything below this
+line is about the *original* build, which is finished.
 
-So there is no next stage — only candidates, none of them required:
+**That original build order is finished.** Every stage in `CLAUDE.md` is done
+and verified on hardware, and the definition of done is met: the chip shows
+both percentages and their reset times, refreshes itself every 45 seconds,
+and degrades visibly rather than silently when the service or the network
+drops.
+
+So there is no next stage in the original plan — only candidates, none of
+them required:
 
 - **The expressive face.** Deferred since stage 6 with the condition "revisit
   once the display works and the real free-flash number is known". Both are now

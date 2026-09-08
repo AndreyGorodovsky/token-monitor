@@ -31,6 +31,30 @@ Then open `main/secrets.h` and fill in your real WiFi name and password, plus
 Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 5 GHz under one name, that is the first thing to suspect on a failure.
 
+## Where the configuration comes from
+
+As of the `wifi-provisioning` branch the four settings — WiFi SSID and
+password, and `pc_service`'s host and port — are read at **runtime**, not
+compiled in. Each one is taken from NVS if present, and otherwise from
+`secrets.h`, **per value rather than all-or-nothing**. The `config:` lines
+printed at boot say where each one came from, and are the first thing to read
+when the chip is talking to the wrong place:
+
+```
+I (404) config:   ssid     "your-network"   (from secrets.h)
+I (414) config:   host     "192.168.1.50"   (from nvs)
+```
+
+`secrets.h` is therefore **optional** — the firmware builds and links without
+it. It is not yet possible to provision a chip that has no `secrets.h`,
+though, because the setup portal that would do it is still being built; until
+then the only alternative is a hand-generated NVS image
+(`nvs_partition_gen.py`). The password is never logged, only its length.
+
+There is also a **setup button on D1** (see `../ARCHITECTURE.md`). A
+three-second hold is what counts; short taps are ignored deliberately. It
+currently draws a placeholder and is what will open the setup portal.
+
 ## Where this is in the build order
 
 **Stage 8: polish** (`CLAUDE.md`'s build order) — written, flashed, and

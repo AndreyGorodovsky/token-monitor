@@ -125,3 +125,22 @@ The chip, sitting on a desk connected to WiFi, shows current 5-hour and
 7-day usage percentages and their reset times, refreshing on its own every
 30–60 seconds, and degrades visibly (not silently) if the PC service or
 network drops.
+
+## Follow-on work: WiFi provisioning
+
+The definition of done above is met, and the eight-stage build order is
+finished. A follow-on feature is being built on the `wifi-provisioning`
+branch: a button that puts the chip into its own WiFi hotspot serving a setup
+form, so changing networks or PC address no longer needs an editor, a
+toolchain and a USB cable.
+
+It has its own five-stage order and its own set of decisions that should not
+be re-argued. **`STATUS.md`'s "WiFi provisioning" section is the authority on
+both** — read it before touching that branch. The same working rules apply:
+small stages, each verified on hardware before the next one starts.
+
+The hard constraints above still hold, and one gains a second home: the WiFi
+password can now live in the chip's NVS as well as in `secrets.h`. **NVS is
+not encrypted**, so it is readable over USB — no worse than a compiled-in
+`#define`, but it is a second place the value exists. `SECRETS.md`'s
+inventory covers it.

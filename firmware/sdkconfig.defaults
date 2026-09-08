@@ -10,3 +10,17 @@
 # but there is no reason to leave it wrong.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Give the app 1.5 MB instead of the default 1 MB.
+#
+# IDF's default single-app table leaves a 0x100000 factory partition, and by
+# the end of stage 8 plus the gauge arcs only about 68 KB of that was free.
+# SoftAP provisioning adds esp_http_server, AP-mode support and an HTML page
+# on top of that -- probably a fit, but "probably" is a bad thing to find out
+# halfway through writing a feature. This raises the partition to 0x180000.
+#
+# There is no cost: the chip has 4 MB of flash and the rest was simply unused.
+# Note that changing the table moves where the app lives, so the table itself
+# has to be rewritten on the next flash -- `idf.py flash` does that; flashing
+# the app alone would leave a mismatch.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

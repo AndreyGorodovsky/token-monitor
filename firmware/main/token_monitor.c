@@ -106,6 +106,7 @@
 
 #include "config.h"                  /* the four runtime values: NVS first,
                                       * secrets.h as the fallback           */
+#include "button.h"                  /* the setup button on D1              */
 
 /* Every log line we emit is prefixed with this, so our messages stay
  * greppable among the much noisier driver output ("wifi:", "esp_netif_
@@ -122,7 +123,7 @@ static const char *TAG = "token_monitor";
  *
  * We use exactly one bit. BIT0 is just the value 1; a second independent flag
  * would be BIT1, then BIT2, and so on. */
-static EventGroupHandle_t s_wifi_events;
+static EventGroupHandle_t s_events;
 
 /* The configuration this run is using: WiFi credentials, and where pc_service
  * lives. Filled once by config_load() at the top of app_main, before anything
@@ -130,6 +131,15 @@ static EventGroupHandle_t s_wifi_events;
  * the event handlers and usage_task to read without a lock. */
 static app_config_t s_cfg;
 #define WIFI_CONNECTED_BIT BIT0
+
+/* Set by the button task when a long press completes; cleared by usage_task
+ * once it has acted on it. It lives in the same group as the WiFi bit for one
+ * concrete reason: usage_task sometimes blocks waiting for the radio to come
+ * back, and FreeRTOS cannot wait on two event groups at once. A button in a
+ * group of its own would therefore be ignored during exactly the situation
+ * where you are most likely to press it -- the network is broken and you want
+ * to reconfigure it. */
+#define BUTTON_SETUP_BIT   BIT1
 
 /* Reconnect attempts since the last success. Only used for logging at this
  * stage -- we retry forever, because a desk gadget that gives up after five
@@ -255,7 +265,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 
         /* Clear the flag first: nothing waiting on it should go on believing
          * we are connected while we retry. */
-        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
 
         /* The reason code is the single most useful number when this stage
          * fails. Common ones: 201 = AP not found (wrong SSID, or the network
@@ -316,7 +326,7 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
              IP2STR(&e->ip_info.netmask), IP2STR(&e->ip_info.gw));
 
     /* Setting the bit is what wakes app_main out of xEventGroupWaitBits. */
-    xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+    xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
 }
 
 /* --- stage 5: fetching and parsing the usage JSON ------------------------ */
@@ -1363,7 +1373,7 @@ static void fetch_once(char *storage, int storage_cap)
          * calling that NO LINK would send someone to debug the PC over what is
          * actually a radio problem: exactly the misdiagnosis the NO WIFI /
          * NO LINK split was added to prevent. */
-        if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
+        if (!(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT)) {
             ESP_LOGW(TAG, "request failed (%s), and wifi is down -- the link "
                           "dropped mid-request, so this is not the PC",
                      esp_err_to_name(err));
@@ -1487,12 +1497,33 @@ static void usage_task(void *arg)
 
     while (1) {
 
+        /* The button, first thing, so a press is answered before anything
+         * slow happens. usage_task rather than the button task does this,
+         * because the button task must not draw: the panel belongs to this
+         * task alone once app_main has handed it over.
+         *
+         * Stage 2 has nothing to enter yet, so it acknowledges and carries on.
+         * The acknowledgement is not decoration -- it is what proves the whole
+         * chain (pin, debounce, event bit, task wake, display) works, and it
+         * is the thing stage 4 replaces with the actual setup screen. */
+        if (xEventGroupGetBits(s_events) & BUTTON_SETUP_BIT) {
+            xEventGroupClearBits(s_events, BUTTON_SETUP_BIT);
+            ESP_LOGI(TAG, "setup requested -- no setup mode to enter yet (stage 2)");
+            render_message("BUTTON", "HELD 3S");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            /* render_message called forget_drawn(), so whatever is drawn next
+             * repaints in full rather than diffing against a screen that is no
+             * longer there. Falling through to the normal path from here is
+             * deliberate: it puts the real numbers back immediately instead of
+             * leaving this message up until the next refresh. */
+        }
+
         /* Ask the radio before spending a ten-second HTTP timeout discovering
          * something it already knows. This also gets the diagnosis right on
          * screen: NO WIFI points at the network, NO LINK points at the PC, and
          * a firmware that showed NO LINK whenever the router rebooted would
          * send you to debug the wrong machine. */
-        if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
+        if (!(xEventGroupGetBits(s_events) & WIFI_CONNECTED_BIT)) {
 
             /* Two different situations that look identical to the radio. At
              * boot the chip has simply not associated yet, which takes up to
@@ -1514,8 +1545,12 @@ static void usage_task(void *arg)
              * instead of up to 45 seconds later. The reconnect attempts
              * themselves are the disconnect handler's job and are already
              * running; this only waits for them to succeed. */
-            xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT,
-                                pdFALSE, pdTRUE,
+            /* pdFALSE for xWaitForAllBits: wake on EITHER the radio coming
+             * back or the button being held, whichever happens first. Bits are
+             * not cleared on exit -- the loop's top clears the button bit
+             * itself, after it has decided what to do about it. */
+            xEventGroupWaitBits(s_events, WIFI_CONNECTED_BIT | BUTTON_SETUP_BIT,
+                                pdFALSE, pdFALSE,
                                 pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
             continue;
         }
@@ -1529,7 +1564,13 @@ static void usage_task(void *arg)
         ESP_LOGI(TAG, "free heap %" PRIu32 " bytes; next refresh in %d s",
                  esp_get_free_heap_size(), REFRESH_INTERVAL_MS / 1000);
 
-        vTaskDelay(pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
+        /* Was a plain vTaskDelay. Waiting on the bit instead is what makes
+         * the button feel like it works: a press during the 45-second gap is
+         * acted on immediately rather than whenever the timer happens to
+         * expire. With no press this behaves exactly as the sleep did. */
+        xEventGroupWaitBits(s_events, BUTTON_SETUP_BIT,
+                            pdFALSE, pdFALSE,
+                            pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
     }
 }
 
@@ -1756,7 +1797,7 @@ void app_main(void)
 
     /* Must exist before wifi_start(), because the handlers it registers can
      * fire -- and touch this group -- the instant the radio starts. */
-    s_wifi_events = xEventGroupCreate();
+    s_events = xEventGroupCreate();
 
     ESP_LOGI(TAG, "stage 8: wifi, then refresh every %d s forever",
              REFRESH_INTERVAL_MS / 1000);
@@ -1784,6 +1825,12 @@ void app_main(void)
      * control; nothing here needs one, since the task runs for the life of the
      * program. */
     xTaskCreate(&usage_task, "usage", 8192, NULL, 5, NULL);
+
+    /* After usage_task, so the log reads in the order things become true --
+     * though the ordering does not actually matter: a press that lands before
+     * usage_task is scheduled just leaves the bit set, and the first pass of
+     * the loop picks it up. */
+    button_start(s_events, BUTTON_SETUP_BIT);
 
     /* Heartbeat, so a silent serial monitor means "the chip crashed or reset"
      * rather than leaving you guessing whether it is merely idle. It is also

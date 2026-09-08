@@ -25,9 +25,15 @@ key. Two consequences worth stating plainly:
   binary — but it is now a second place the value exists, and moving the
   gadget on to someone else means erasing it (`idf.py erase-flash`) rather
   than just not handing over `secrets.h`.
-- **The repo is now clone-and-flash.** Because `secrets.h` is optional,
-  nothing about publishing this repository requires a reader to receive, or
-  invent, any credential to get a working build.
+- **The repo builds without any credential — but is not yet
+  clone-and-flash.** Because `secrets.h` is optional, nothing about
+  publishing this repository requires a reader to receive, or invent, any
+  secret to get a *building* image. Getting a *working* one still needs a
+  `secrets.h`, because the setup portal that would let a reader provision the
+  chip over WiFi does not exist yet: today the only other way in is
+  hand-generating an NVS image with `nvs_partition_gen.py`. Revisit this
+  sentence when the portal lands — it is the thing that makes the claim
+  true.
 
 Nothing else in this project should hold a real credential. If a future
 stage adds one (an API key, a different token, a password), add it to this

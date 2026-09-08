@@ -256,7 +256,21 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 {
     if (id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "wifi started, connecting to \"%s\"...", s_cfg.ssid);
-        esp_wifi_connect();
+
+        /* The return value used to be discarded, which was safe only while the
+         * SSID was a compile-time literal that always existed. It can now be
+         * empty, and esp_wifi_connect() rejects that with ESP_ERR_WIFI_SSID
+         * *without* emitting WIFI_EVENT_STA_DISCONNECTED -- so the retry path
+         * below never runs, nothing is logged, and the radio simply sits there
+         * silently. Failing quietly is the one outcome this project keeps
+         * trying to design out. */
+        esp_err_t cerr = esp_wifi_connect();
+        if (cerr != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(cerr));
+            ESP_LOGE(TAG, "no disconnect event follows this, so nothing will "
+                          "retry on its own -- check the ssid in the config: "
+                          "lines above");
+        }
         return;
     }
 
@@ -1332,11 +1346,20 @@ static void fetch_once(char *storage, int storage_cap)
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
-        /* Out of memory, which on this chip means something else has leaked.
+        /* Two possible causes, and this code cannot tell them apart: no
+         * memory, or a URL the client could not parse. It used to name the
+         * first one only, which was defensible while the URL was a compile-time
+         * constant that could not be malformed. Now that it is assembled from
+         * runtime config it can be, so the log offers both and prints the URL
+         * -- and the banner no longer claims a memory fault it did not
+         * diagnose. The usual malformed case (an empty host) is caught by the
+         * completeness guard in usage_task and never arrives here.
+         *
          * Not fatal -- the loop will try again in 45 seconds -- but the screen
          * must not go on implying the numbers are current. */
-        ESP_LOGE(TAG, "esp_http_client_init failed (out of memory?)");
-        show_failure("NO LINK", "NO LINK", "OUT OF MEM");
+        ESP_LOGE(TAG, "esp_http_client_init failed for \"%s\" "
+                      "(malformed url, or out of memory)", s_usage_url);
+        show_failure("NO LINK", "NO LINK", "INIT FAILED");
         return;
     }
 
@@ -1493,7 +1516,15 @@ static void usage_task(void *arg)
      * seconds rather than after an hour of blaming the firewall. Repeating it
      * every 45 seconds would bury the lines that only appear when something is
      * actually wrong. */
-    ESP_LOGI(TAG, "polling %s every %d s", s_usage_url, REFRESH_INTERVAL_MS / 1000);
+    if (config_is_complete(&s_cfg)) {
+        ESP_LOGI(TAG, "polling %s every %d s", s_usage_url, REFRESH_INTERVAL_MS / 1000);
+    } else {
+        /* Announcing "polling http://:0/usage every 45 s" while deliberately
+         * polling nothing is the same species of misleading log as the OUT OF
+         * MEM banner this review pass removed. The loop below says what is
+         * actually happening instead. */
+        ESP_LOGW(TAG, "not polling: no usable config yet");
+    }
 
     while (1) {
 
@@ -1516,6 +1547,36 @@ static void usage_task(void *arg)
              * longer there. Falling through to the normal path from here is
              * deliberate: it puts the real numbers back immediately instead of
              * leaving this message up until the next refresh. */
+        }
+
+        /* Nothing usable to connect to or poll. This has to be checked HERE,
+         * not only once in app_main, for two reasons found in review:
+         *
+         *   1. app_main draws NO CONFIG and then creates this task at priority
+         *      5 against its own priority 1, so this task preempts instantly,
+         *      finds WIFI_CONNECTED_BIT clear, and used to repaint CONNECTING
+         *      straight over it. An unconfigured chip therefore sat on
+         *      CONNECTING forever, which says "wait a moment" about a state
+         *      that will never change on its own.
+         *   2. With an SSID but no host, WiFi associates, so the loop would
+         *      reach fetch_once with s_usage_url built as "http://:0/usage".
+         *      esp_http_client_init cannot parse that and returns NULL, which
+         *      fetch_once reports as OUT OF MEM -- a memory fault blamed for a
+         *      missing address.
+         *
+         * Returning here fixes both, and fixes the second at the root rather
+         * than by improving the wrong error message. render_message dedupes,
+         * so this repaints nothing on later passes; the log line does repeat,
+         * deliberately, because app_main's explanation has long scrolled past
+         * by the time anyone attaches a monitor. */
+        if (!config_is_complete(&s_cfg)) {
+            ESP_LOGW(TAG, "config incomplete -- ssid, host and port must all "
+                          "be set; not connecting or polling");
+            render_message("NO CONFIG", "SEE SERIAL");
+            xEventGroupWaitBits(s_events, BUTTON_SETUP_BIT,
+                                pdFALSE, pdFALSE,
+                                pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
+            continue;
         }
 
         /* Ask the radio before spending a ten-second HTTP timeout discovering

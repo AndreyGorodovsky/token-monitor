@@ -1,7 +1,8 @@
 /* The setup button: one GPIO, polled, debounced, reporting long presses.
  *
- * Wiring (see ARCHITECTURE.md): one leg to D1 / GPIO3, the other to GND, with
- * no resistor of your own. The internal pull-up does the rest, which makes the
+ * Wiring (ARCHITECTURE.md's "Setup button" table is the authority, and is
+ * where someone assembling the gadget will look): one leg to D1 / GPIO3, the
+ * other to GND, with no resistor of your own. The internal pull-up does the rest, which makes the
  * pin read 1 when released and 0 when pressed -- backwards from intuition, and
  * the reason button.c says so more than once.
  *

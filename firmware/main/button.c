@@ -9,6 +9,11 @@
  */
 
 #include <stdbool.h>
+#include <inttypes.h>            /* PRId64, per the convention token_monitor.c
+                                  * sets out: int64_t is not the same
+                                  * underlying type everywhere, so the format
+                                  * specifier is spelled by the header rather
+                                  * than guessed at as "%lld"               */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -60,12 +65,33 @@ static void button_task(void *arg)
     button_ctx_t ctx = *(button_ctx_t *)arg;   /* copied: the caller's struct
                                                 * is on app_main's stack      */
 
-    bool     stable_pressed = false;  /* the debounced state                  */
-    int      candidate      = -1;     /* a raw level seen but not yet trusted */
-    int      agree_count    = 0;      /* how many samples have agreed         */
-    int64_t  pressed_at_us  = 0;      /* when the current press began         */
-    bool     fired          = false;  /* long press already reported for this
-                                       * press; cleared only on release       */
+    /* Seeded from the pin as it is RIGHT NOW, not from a hopeful "released".
+     *
+     * Starting from stable_pressed = false means a pin that is already low --
+     * a 4-leg tactile switch miswired onto one internally-shorted pair, or a
+     * button genuinely held down through a reset -- looks like a brand new
+     * press a few polls after boot, and fires a long press three seconds into
+     * every single boot. At this stage that is a harmless message; once the
+     * long press opens the setup portal it would mean a miswired button drops
+     * the gadget into setup mode on every power-on and it never reaches normal
+     * operation. Exactly backwards from the "setup would be unreachable"
+     * warning this file used to print.
+     *
+     * Seeding stable_pressed alone is not enough, and this is the subtle part:
+     * pressed_at_us would then be 0, so the very first poll would compute a
+     * held time of "since boot" and fire immediately. The press has to start
+     * out already spent. ignore_current_press does that, and says why in the
+     * log when the button is finally let go. */
+    int      level0               = gpio_get_level(BUTTON_GPIO);
+    bool     start_pressed        = (level0 == PRESSED_LEVEL);
+
+    bool     stable_pressed       = start_pressed;
+    int      candidate            = level0;   /* already believed, hence  */
+    int      agree_count          = DEBOUNCE_SAMPLES;   /* fully agreed   */
+    int64_t  pressed_at_us        = esp_timer_get_time();
+    bool     fired                = false;  /* long press already reported for
+                                             * this press; cleared on release */
+    bool     ignore_current_press = start_pressed;  /* must be released first */
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -97,15 +123,25 @@ static void button_task(void *arg)
         } else if (!now_pressed && stable_pressed) {
             stable_pressed = false;
             int64_t held_ms = (esp_timer_get_time() - pressed_at_us) / 1000;
-            /* Reporting the duration of a press that did NOT qualify is the
-             * useful half of this line: "released after 2740 ms" tells you the
-             * button works and you let go early, which is a completely
-             * different problem from "nothing happened". */
-            ESP_LOGI(TAG, "released after %lld ms%s",
-                     (long long)held_ms, fired ? " (long press already reported)" : "");
+
+            if (ignore_current_press) {
+                /* The press that was already underway at boot has ended, so
+                 * the button is now trustworthy. Worth a line of its own: if
+                 * this appears without anyone touching the board, the pin is
+                 * shorted rather than pressed. */
+                ESP_LOGI(TAG, "released -- was already down at startup, now armed");
+                ignore_current_press = false;
+            } else {
+                /* Reporting the duration of a press that did NOT qualify is
+                 * the useful half of this line: "released after 2740 ms" says
+                 * the button works and you let go early, which is a completely
+                 * different problem from "nothing happened". */
+                ESP_LOGI(TAG, "released after %" PRId64 " ms%s",
+                         held_ms, fired ? " (long press already reported)" : "");
+            }
             fired = false;
 
-        } else if (now_pressed && !fired) {
+        } else if (now_pressed && !fired && !ignore_current_press) {
             int64_t held_ms = (esp_timer_get_time() - pressed_at_us) / 1000;
             if (held_ms >= BUTTON_HOLD_MS) {
                 /* Fire on reaching the threshold, not on release. Holding a
@@ -113,7 +149,7 @@ static void button_task(void *arg)
                  * makes a long press feel deliberate rather than laggy -- and
                  * it means letting go afterwards cannot cancel it. */
                 fired = true;
-                ESP_LOGI(TAG, "long press (%lld ms) -- setup requested", (long long)held_ms);
+                ESP_LOGI(TAG, "long press (%" PRId64 " ms) -- setup requested", held_ms);
                 xEventGroupSetBits(ctx.events, ctx.bit);
             }
         }
@@ -146,13 +182,17 @@ void button_start(EventGroupHandle_t events, EventBits_t long_press_bit)
     ESP_LOGI(TAG, "GPIO%d (D1) ready, idle level %d (%s)",
              BUTTON_GPIO, level, level == PRESSED_LEVEL ? "PRESSED" : "released");
     if (level == PRESSED_LEVEL) {
-        /* Reads pressed before anyone has touched it. Not fatal -- and not
-         * something to refuse to start over -- but it means the button will
-         * never produce an edge, so setup mode would be unreachable and the
-         * reason would be invisible. Say it once, loudly, at boot. */
+        /* Reads pressed before anyone has touched it. Not fatal, and not worth
+         * refusing to start over -- but it does mean the button can never
+         * produce a usable press, because the task treats an already-low pin
+         * as spent and waits for a release that will never come. Setup mode is
+         * therefore unreachable until the wiring is fixed, which is worth
+         * saying loudly rather than leaving to be discovered. */
         ESP_LOGW(TAG, "button reads PRESSED at rest -- check the wiring:");
         ESP_LOGW(TAG, "  a 4-leg tactile switch with both wires on the same");
         ESP_LOGW(TAG, "  internally-shorted pair looks exactly like this");
+        ESP_LOGW(TAG, "  (it is treated as already-spent, so it will NOT");
+        ESP_LOGW(TAG, "   self-trigger setup mode -- it simply will not work)");
     }
 
     /* The context has to outlive this function: the task reads it after

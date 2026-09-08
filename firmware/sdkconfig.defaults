@@ -23,4 +23,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 # Note that changing the table moves where the app lives, so the table itself
 # has to be rewritten on the next flash -- `idf.py flash` does that; flashing
 # the app alone would leave a mismatch.
+#
+# IMPORTANT, and not obvious: this file supplies DEFAULTS. kconfgen applies it
+# underneath an existing `sdkconfig`, which wins. So on a tree that has already
+# been built once, this line changes nothing at all and does so silently -- you
+# keep the 1 MB partition. Delete `firmware/sdkconfig` (it is gitignored and
+# regenerated) or set the option in `idf.py menuconfig`. The symptom of missing
+# this is not an error here; it is a puzzling "app partition is too small" at
+# link time later, once the firmware has grown into the space this was meant to
+# provide.
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

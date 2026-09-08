@@ -26,6 +26,9 @@ soak/
 firmware/.vscode/
 
 # Machine-generated build config. The settings that matter live in
-# sdkconfig.defaults, which IS committed; these are regenerated from it.
+# sdkconfig.defaults, which IS committed. Note "regenerated" means regenerated
+# when ABSENT: an existing sdkconfig takes precedence over sdkconfig.defaults,
+# so after pulling a change to that file you have to delete this one (or use
+# menuconfig) for the change to take effect. See the note in sdkconfig.defaults.
 firmware/sdkconfig
 firmware/sdkconfig.old

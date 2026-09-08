@@ -34,12 +34,28 @@
  * because the cache lives outside the build directory. The symptom is a chip
  * that ignores a secrets.h you can see perfectly well on disk.
  *
- * The fix is one build that refreshes the cache entry:
+ * There are TWO layers to get past, which is why the obvious single remedies
+ * all fail -- each was tried here and did not work:
  *
- *     CCACHE_RECACHE=1 idf.py build      (or: idf.py --no-ccache build)
+ *   - ninja decides whether to invoke the compiler at all. It consults the .d
+ *     dependency file, which does not list secrets.h, so it considers the
+ *     object up to date and runs nothing. CCACHE_RECACHE alone therefore does
+ *     nothing: ccache is never even called.
+ *   - ccache decides what that invocation returns. So `idf.py fullclean`
+ *     alone does not work either: ninja rebuilds, calls ccache, and ccache
+ *     hands back the same stale object.
  *
- * after which ordinary builds are correct again. This is a property of
- * conditional includes in general, not of this file. */
+ * Both have to be defeated together:
+ *
+ *     idf.py fullclean
+ *     CCACHE_RECACHE=1 idf.py build
+ *
+ * RECACHE rather than --no-ccache on purpose: --no-ccache bypasses the cache
+ * for that one build and leaves the poisoned entry in place to be served
+ * again later, while RECACHE replaces it. After this, ordinary builds are
+ * correct.
+ *
+ * This is a property of conditional includes in general, not of this file. */
 #if defined(__has_include)
 #  if __has_include("secrets.h")
 #    include "secrets.h"

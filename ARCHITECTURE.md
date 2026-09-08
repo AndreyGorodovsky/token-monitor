@@ -234,6 +234,36 @@ particularly GND vs. VCC, since swapping those two is the one mistake that
 can actually damage it; the signal pins (SCL/SDA/RES/DC/CS) are safe to
 mis-map and just won't work until corrected in code.
 
+**Setup button on the XIAO ESP32-C3:**
+
+| Button | XIAO pin | GPIO |
+|---|---|---|
+| one leg | D1 | GPIO3 |
+| other leg | GND | — |
+
+No resistor of your own. The firmware enables the chip's internal pull-up, so
+a released button reads 1 and a pressed one reads 0 — pressed is LOW, which is
+worth knowing before reading the driver.
+
+D1 was chosen over the alternatives for two reasons, both about what happens
+at reset rather than during normal operation:
+
+- **It has no strapping role.** GPIO2, GPIO8 and GPIO9 are sampled at reset to
+  decide how the chip boots, so a button holding one of them at a fixed level
+  can change the boot mode. GPIO2 is the trap for this particular wiring: it
+  must be high at reset, and a button to GND idles it low.
+- **It is not the serial console.** GPIO20/21 are UART0, i.e. the serial
+  monitor used to debug everything else.
+
+GPIO9 is the onboard BOOT button and needs no wiring at all, which is
+tempting — but held across a reset it drops the chip into the bootloader, so
+it is a poor choice for the control you reach for when something is confusing
+you. It is also a surface-mount button an enclosure would hide.
+
+A **3-second hold** is what counts; short taps are ignored, deliberately,
+because a desk object that reconfigures itself when brushed is a bad desk
+object. The same 3-second hold is also how you leave setup mode again.
+
 **Layout.** 240x240 color and round is a canvas worth designing *for*,
 rather than dropping a rectangular block of text into. Some options, not
 prescriptive: a ring/arc gauge around the edge for each utilization

@@ -5,13 +5,20 @@ much of the 5-hour rolling window and the 7-day rolling window has been used,
 and when each one resets — on a round 1.28" colour display driven by a Seeed
 XIAO ESP32-C3. Each window gets a gauge arc around the rim and a large
 colour-banded percentage, so it reads at a glance from across a desk. It
-refreshes itself over WiFi every 45 seconds; there are no buttons and nothing
-to check manually.
+refreshes itself over WiFi every 45 seconds, with nothing to check manually and
+nothing to press in normal use.
+
+There is one button, and it is only for setup: hold it for three seconds and
+the gadget becomes its own WiFi hotspot serving a settings form, so changing
+networks or the PC's address takes a phone and about ninety seconds instead of
+an editor, a toolchain and a USB cable.
 
 **Status:** complete. All eight stages of the build order are written and
 verified on hardware — the chip sits on a desk, updates itself, recovers from
 a dropped network on its own, and says so on the screen when it cannot get
-fresh numbers. See [`STATUS.md`](STATUS.md) for the detailed build log.
+fresh numbers. WiFi provisioning was added afterwards and is complete too. See
+[`STATUS.md`](STATUS.md) for the detailed build log, including the two things
+about provisioning that are known-imperfect.
 
 ## How it works
 
@@ -46,7 +53,7 @@ about now, and the display should not be able to imply otherwise.
 token-monitor/
 ├── README.md               you are here
 ├── ARCHITECTURE.md         the design: components, JSON contract, wiring, layout
-├── STATUS.md               build log — what is verified, what is next
+├── STATUS.md               build log — what is verified, and what is not
 ├── SECRETS.md              what is sensitive, and the pre-publish checklist
 ├── CLAUDE.md               project brief for AI coding assistants (see below)
 ├── .gitignore
@@ -67,13 +74,19 @@ token-monitor/
         ├── CMakeLists.txt
         ├── token_monitor.c the firmware itself
         ├── gc9a01.c/.h     hand-rolled driver for the round display
+        ├── config.c/.h     the four settings: NVS first, secrets.h as fallback
+        ├── button.c/.h     the setup button — polled, debounced, long press
+        ├── provision.c/.h  setup mode: the hotspot, the form, and the save
+        ├── captive_dns.c/.h  answers every name with the gadget's own address,
+        │                   so the form can open by itself
         ├── font5x7.h       generated — do not edit by hand
         └── secrets.h.example  template — copy to secrets.h and fill in
 ```
 
 `secrets.h` (real WiFi credentials and the PC's LAN address) and
 `firmware/.vscode/` are deliberately absent: they are gitignored, being
-per-machine. Everything needed to recreate them is in the repo.
+per-machine. Everything needed to recreate them is in the repo — and since
+provisioning landed, `secrets.h` is optional anyway.
 
 ## Hardware
 
@@ -91,6 +104,18 @@ per-machine. Everything needed to recreate them is in the repo.
 | RES | D4 | GPIO6 |
 | DC | D5 | GPIO7 |
 | CS | D8 | GPIO8 |
+
+| Setup button | XIAO pin | GPIO |
+|---|---|---|
+| one leg | D1 | GPIO3 |
+| other leg | GND | — |
+
+The button needs no resistor of your own — the firmware enables the chip's
+internal pull-up, so a released button reads high and a pressed one reads low.
+D1 was chosen because it has no strapping role and is not the serial console,
+so a button held down across a reset cannot change how the chip boots. It is
+optional: without it everything works except setup mode, which can still be
+reached by flashing a chip that has no configuration.
 
 Check GND and VCC against the display's own silkscreen before powering it —
 swapping those two is the one wiring mistake that can damage the panel. The
@@ -145,6 +170,23 @@ Firewall details and troubleshooting are in
 
 ### 2. The firmware
 
+Build and flash with ESP-IDF (target `esp32c3`), opening the editor on
+`firmware/` rather than the repository root. See
+[`firmware/README.md`](firmware/README.md).
+
+There are two ways to tell the chip your WiFi and the PC's address, and it
+needs exactly one of them.
+
+**Flash it and fill in the form.** With no `secrets.h` the firmware still
+builds, and a chip with no configuration comes up as its own WiFi hotspot
+serving a settings form — the network name, its password and the address to
+open are all on the round screen. Join it from a phone, fill in the four
+values, and it saves them and restarts. Nothing to edit, and no cable needed
+after the first flash.
+
+**Or compile them in**, which is quicker if you have the toolchain open
+anyway:
+
 ```
 cd firmware/main
 copy secrets.h.example secrets.h     REM Windows
@@ -152,10 +194,10 @@ cp secrets.h.example secrets.h       # Linux
 ```
 
 Fill in the WiFi credentials and the LAN address of the machine running
-`pc_service`. The build fails loudly without this file, on purpose. Then
-build and flash with ESP-IDF (target `esp32c3`), opening the editor on
-`firmware/` rather than the repository root. See
-[`firmware/README.md`](firmware/README.md).
+`pc_service`. Values saved through the form live in the chip's NVS and take
+precedence over `secrets.h`, per value — so you can compile in a network and
+still correct the PC's address from a phone later. `pc_service` prints the
+address to use when it starts.
 
 ## Security
 

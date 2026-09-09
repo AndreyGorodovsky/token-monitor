@@ -129,15 +129,18 @@ network drops.
 ## Follow-on work: WiFi provisioning
 
 The definition of done above is met, and the eight-stage build order is
-finished. A follow-on feature is being built on the `wifi-provisioning`
-branch: a button that puts the chip into its own WiFi hotspot serving a setup
-form, so changing networks or PC address no longer needs an editor, a
-toolchain and a USB cable.
+finished. A follow-on feature was then built on the `wifi-provisioning`
+branch, and is **complete**: a button that puts the chip into its own WiFi
+hotspot serving a setup form, so changing networks or PC address no longer
+needs an editor, a toolchain and a USB cable. A chip with nothing in it at all
+raises that hotspot by itself, and credentials that have never worked bring it
+back there rather than leaving the gadget stuck.
 
-It has its own five-stage order and its own set of decisions that should not
+It had its own five-stage order and its own set of decisions that should not
 be re-argued. **`STATUS.md`'s "WiFi provisioning" section is the authority on
-both** — read it before touching that branch. The same working rules apply:
-small stages, each verified on hardware before the next one starts.
+both** — read it before touching that work, including what is known-imperfect
+about it. The same working rules applied throughout: small stages, each
+verified on hardware before the next one started.
 
 The hard constraints above still hold, and one gains a second home: the WiFi
 password can now live in the chip's NVS as well as in `secrets.h`. **NVS is

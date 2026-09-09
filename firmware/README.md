@@ -14,9 +14,15 @@ looks for `CMakeLists.txt` there; the parent folder holds only docs.
 
 ## First-time setup
 
-The build **will not compile** until you create your own `secrets.h` — this
-is deliberate, so a missing config fails loudly at build time instead of
-mysteriously at runtime:
+You need to tell the chip your WiFi and the address of the machine running
+`pc_service`, and there are two ways to do it. It needs one of them, not both.
+
+**Flash it and fill in the form.** The build compiles without any `secrets.h`,
+and a chip with no configuration comes up as its own WiFi hotspot serving a
+settings form — network name, password and the address to open are all on the
+round screen. Join it from a phone and fill in the four values.
+
+**Or compile them in:**
 
 ```
 copy main\secrets.h.example main\secrets.h     REM Windows
@@ -25,17 +31,21 @@ cp main/secrets.h.example main/secrets.h       # Linux
 
 Then open `main/secrets.h` and fill in your real WiFi name and password, plus
 `PC_SERVICE_HOST` / `PC_SERVICE_PORT` — the LAN address of the machine running
-`pc_service`. That file is gitignored and never committed; `secrets.h.example`
-(fake values) is the committed template. See `../SECRETS.md`.
+`pc_service`, which `pc_service` prints when it starts. That file is gitignored
+and never committed; `secrets.h.example` (fake values) is the committed
+template. See `../SECRETS.md`.
+
+(This section used to say the build would not compile without `secrets.h`,
+which was true until the settings moved to NVS. If you are reading an older
+copy of these notes, that is the line to distrust.)
 
 Note the ESP32-C3 is **2.4 GHz only**. If the router publishes 2.4 and
 5 GHz under one name, that is the first thing to suspect on a failure.
 
 ## Where the configuration comes from
 
-As of the `wifi-provisioning` branch the four settings — WiFi SSID and
-password, and `pc_service`'s host and port — are read at **runtime**, not
-compiled in. Each one is taken from NVS if present, and otherwise from
+The four settings — WiFi SSID and password, and `pc_service`'s host and port —
+are read at **runtime**, not compiled in. Each one is taken from NVS if present, and otherwise from
 `secrets.h`, **per value rather than all-or-nothing**. The `config:` lines
 printed at boot say where each one came from, and are the first thing to read
 when the chip is talking to the wrong place:
@@ -141,8 +151,12 @@ Two things worth knowing before you try it:
 ## Where this is in the build order
 
 **Stage 8: polish** (`CLAUDE.md`'s build order) — written, flashed, and
-verified on hardware. This is the last stage: every stage in the build order is
-now done, and the chip meets the definition of done.
+verified on hardware. That was the last stage of the original build order:
+every stage in it is done, and the chip meets the definition of done.
+
+A second, five-stage piece of work followed it — WiFi provisioning, the setup
+button and everything behind it, described above and logged in `STATUS.md`.
+It is complete as well.
 
 Stages 3 (WiFi), 4 (HTTP to a throwaway URL), 5 (the real service, parsed with
 cJSON), 6 (panel bring-up) and 7 (rendering) were each verified on hardware

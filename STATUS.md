@@ -11,13 +11,23 @@ fresh numbers. Two gauge arcs around the rim were added afterwards — see "The
 gauge arcs" below.
 
 **You are on the `wifi-provisioning` branch**, where a follow-on feature is
-half built: a button that puts the chip into a WiFi hotspot serving a setup
-form, so changing networks or PC address stops requiring an editor, a
-toolchain and a USB cable. **It works end to end as of stage 4** -- the PC's
-address was corrected from a phone, and the numbers came back on the panel
-without a cable being touched. Stages 1 through 4 of 5 are done;
-**stage 5, the polish, is next**. See "WiFi provisioning" below, which is the section to
-read first when resuming on this branch. `main` is untouched and still holds
+**complete: all five stages built and verified on hardware**. A button puts the
+chip into a WiFi hotspot serving a setup form, so changing networks or the PC
+address no longer needs an editor, a toolchain and a USB cable. It has been
+used for real on both counts -- the PC's address corrected from a phone, and a
+chip with nothing at all in it provisioned from scratch, neither with a cable
+attached. A wrong password can no longer strand it either: credentials that
+have never worked bring the chip back to the setup hotspot on their own.
+
+Two things are known-imperfect and written up rather than hidden: the captive
+portal does not raise a pop-up on the phone tested (every step the firmware
+owns is verified; what the phone does with it is the phone's business), and
+three failure branches from the last review are reasoned but never observed,
+because they need allocation failures that cannot be produced on a healthy
+board.
+
+See "WiFi provisioning" below, which is the section to read first when resuming
+on this branch. `main` is untouched and still holds
 the finished eight-stage build.
 
 ## Done and verified
@@ -55,7 +65,7 @@ address, means editing `secrets.h` and rebuilding and reflashing. The goal is
 a button that puts the chip into its own WiFi hotspot serving a setup form,
 so the four settings can be changed from a phone in about ninety seconds.
 
-Five stages. **1 through 4 are done and verified on hardware; 5 is next.**
+Five stages. **All five are done and verified on hardware.**
 
 | Stage | State |
 |---|---|
@@ -65,7 +75,7 @@ Five stages. **1 through 4 are done and verified on hardware; 5 is next.**
 | review pass — six findings, all real | **done** (`5c800ef`) |
 | 3 — SoftAP + HTML form, submissions logged but NOT saved | **done** — verified end to end on hardware |
 | 4 — save to NVS, reboot to apply, empty config enters setup | **done** — all three verified on hardware, including a chip with nothing at all |
-| 5 — polish: network list, open-network box, captive portal, recovery | **built**; the portal does not raise a pop-up on the phone tested |
+| 5 — polish: network list, open-network box, captive portal, recovery | **done** — recovery tested with a deliberately wrong password; the portal does not raise a pop-up on the phone tested |
 
 ### Decisions already made — don't re-litigate these
 

@@ -13,8 +13,10 @@ gauge arcs" below.
 **You are on the `wifi-provisioning` branch**, where a follow-on feature is
 half built: a button that puts the chip into a WiFi hotspot serving a setup
 form, so changing networks or PC address stops requiring an editor, a
-toolchain and a USB cable. Stages 1, 2 and 3 of 5 are done and verified;
-**stage 4 is next**. See "WiFi provisioning" below, which is the section to
+toolchain and a USB cable. **It works end to end as of stage 4** -- the PC's
+address was corrected from a phone, and the numbers came back on the panel
+without a cable being touched. Stages 1 through 4 of 5 are done;
+**stage 5, the polish, is next**. See "WiFi provisioning" below, which is the section to
 read first when resuming on this branch. `main` is untouched and still holds
 the finished eight-stage build.
 
@@ -53,7 +55,7 @@ address, means editing `secrets.h` and rebuilding and reflashing. The goal is
 a button that puts the chip into its own WiFi hotspot serving a setup form,
 so the four settings can be changed from a phone in about ninety seconds.
 
-Five stages. **1, 2 and 3 are done and verified on hardware; 4 is next.**
+Five stages. **1 through 4 are done and verified on hardware; 5 is next.**
 
 | Stage | State |
 |---|---|
@@ -62,8 +64,8 @@ Five stages. **1, 2 and 3 are done and verified on hardware; 4 is next.**
 | 2 — the button on D1, debounced, long-press detected | **done** (`1ec88e9`) |
 | review pass — six findings, all real | **done** (`5c800ef`) |
 | 3 — SoftAP + HTML form, submissions logged but NOT saved | **done** — verified end to end on hardware |
-| 4 — save to NVS, reboot to apply, empty config enters setup | **next** |
-| 5 — polish: verify-before-commit, SSID scan dropdown, captive portal | not started |
+| 4 — save to NVS, reboot to apply, empty config enters setup | **done** — the save and the reboot verified on hardware; the empty-config path not yet |
+| 5 — polish: verify-before-commit, SSID scan dropdown, captive portal | **next** |
 
 ### Decisions already made — don't re-litigate these
 
@@ -234,9 +236,12 @@ Decisions worth not re-litigating:
   the existing `firmware/sdkconfig` had to be deleted before the new default
   applied. Now 2048, which is one buffer per server instance (it lives in
   `httpd_data`, not per connection) out of ~190 KB free heap.
-- **Opening or closing the serial port resets this board.** The XIAO ESP32-C3
-  is native USB-CDC, and the DTR/RTS toggle a host does on open and on close
-  reboots the chip. Consequence while testing: a capture that ends mid-session
+- **Opening or closing the serial port usually resets this board.** The XIAO
+  ESP32-C3 is native USB-CDC, and the DTR/RTS toggle a host does on open and on
+  close reboots the chip -- though not invariably: three back-to-back captures
+  at stage 4 began at 32.6 s, 0.14 s and 0.27 s of uptime, so two of the three
+  opens reset it and one did not. Treat a reset as the default and a survivor
+  as luck, rather than the other way round. Consequence while testing: a capture that ends mid-session
   restarts the gadget, and the fresh boot banner looks exactly like the chip
   having rebooted on its own. It cost one wrongly-attributed reboot here — a
   5-minute timeout appeared to have fired at 302 seconds — and was settled by
@@ -267,6 +272,68 @@ Decisions worth not re-litigating:
   which starves the idle task until the watchdog fires. Found in the
   standalone button test; `button.c` polls at 20 ms with a `_Static_assert`
   guarding it.
+
+### Stage 4 as built
+
+The write half of `config.c`, and the two things around it that make a saved
+value take effect.
+
+`config_save(cfg, save_password)` takes a flag rather than just a struct, and
+that flag is the whole design. A blank password field means "keep the one
+already stored", and an empty string cannot express the difference between
+that and "set the password to nothing" -- because an empty password is itself
+legitimate, on an open network. So the caller says which it meant, and a false
+flag leaves the NVS key untouched, whatever it held.
+
+All four values go under a single `nvs_commit()`. Lose power before it and the
+old configuration is intact; lose power after it and the new one is; there is
+no state where the SSID changed and the host did not. The per-key fallback
+from stage 1 remains the safety net underneath that, not a substitute for it.
+
+Three decisions worth not re-arguing:
+
+- **The save does not verify the credentials first.** Verify-before-commit is
+  stage 5, and it cannot be done from inside the request that would have to be
+  answered afterwards -- checking the WiFi means tearing down the AP while
+  someone is watching a page on it. A wrong password is discovered the ordinary
+  way instead: on the next boot, on the screen, with the button still there.
+- **The reboot belongs to the caller, not to `provision.c`.** The handler
+  writes the values, sends the page, and only then sets a flag; `usage_task`
+  notices within a second and restarts. Setting it before the reply had gone
+  out would race the restart against the page and, on a bad day, lose --
+  leaving someone looking at a browser error after a save that worked. It also
+  keeps the promise stage 3 made: one way out of setup mode, not three.
+- **An unconfigured chip gets no timeout.** The five minutes exist to put the
+  gadget back to work after a press nobody followed up on. A chip with no
+  usable config has no work to return to, so timing out would reboot it into a
+  state whose only correct response is to enter setup mode again -- a screen
+  that reboots itself every five minutes forever. It waits indefinitely
+  instead, and the countdown row stays empty rather than counting down to
+  something that will not happen.
+
+**Verified on hardware, and by the sharpest test available:** the PC's address
+was wrong in NVS (`.88` against a PC on `.87`), had been wrong for the whole of
+stage 3, and was corrected from a phone. The boot after the save says it all:
+
+```
+config:   ssid     "<your-network>" (from nvs)
+config:   password 10 chars         (from secrets.h)
+config:   host     "192.168.1.87"   (from nvs)
+config:   port     8734             (from nvs)
+token_monitor: polling http://192.168.1.87:8734/usage every 45 s
+status 200, content-length 279
+```
+
+The password line is the one worth looking at twice. The field was left blank,
+so the `pass` key was never written, and `config_load` fell back to `secrets.h`
+for that one value while taking the other three from NVS. Per-key fallback,
+demonstrated on a real save rather than argued about.
+
+**What is not yet verified: the empty-config path.** "Empty config enters
+setup" needs a chip with nothing in NVS, which means erasing the config that
+was just proved to work. Worth doing deliberately -- it is also the only way to
+exercise the empty-pre-fill case behind the review's `send_value` fix, since a
+blank SSID is exactly what renders it.
 
 ### The hotspot's name stays the same every time — settled
 

@@ -45,11 +45,12 @@ I (404) config:   ssid     "your-network"   (from secrets.h)
 I (414) config:   host     "192.168.1.50"   (from nvs)
 ```
 
-`secrets.h` is therefore **optional** — the firmware builds and links without
-it. It is not yet possible to provision a chip that has no `secrets.h`,
-though: the setup portal serves its form but does not write to NVS yet, so
-until that lands the only alternative is a hand-generated NVS image
-(`nvs_partition_gen.py`). The password is never logged, only its length.
+`secrets.h` is therefore **optional**, and as of provisioning stage 4 it is
+optional in practice and not just in principle: a chip flashed without one
+comes up with an empty configuration, raises its setup hotspot by itself, and
+takes the four values from a phone. Filling in `secrets.h` still works, and is
+still the quickest route if you have the toolchain open anyway. The password is
+never logged, only its length.
 
 ## Setup mode (the button on D1)
 
@@ -72,14 +73,19 @@ shows everything needed to reach it:
 ```
 
 The form comes up pre-filled with the current settings, with the WiFi password
-field blank — leave it blank to keep the one already stored. **This build does
-not save anything yet**: it parses the submission, reports it back, and says so
-in bold on the page. Writing the values is the next stage.
+field blank — leave it blank to keep the one already stored. Submitting it
+saves the values and restarts the chip to use them; the page says so, and the
+panel shows `SAVED`.
 
-To leave: hold the button for three seconds again, or do nothing for five
-minutes. Both reboot the chip. **Entering setup mode deletes nothing**, so an
-accidental press, a timeout, or pulling the power all leave the gadget exactly
-as it was.
+To leave without changing anything: hold the button for three seconds again, or
+do nothing for five minutes. Both reboot the chip. **Entering setup mode
+deletes nothing**, so an accidental press, a timeout, or pulling the power all
+leave the gadget exactly as it was — the settings change only when a form is
+actually submitted.
+
+A chip with no usable configuration — no `secrets.h`, nothing in NVS — enters
+setup mode on its own at boot and stays there, with no five-minute timeout,
+because there is nothing for it to time out back to.
 
 Two things worth knowing before you try it:
 
@@ -349,7 +355,7 @@ over the last known numbers, or a `NO DATA` screen if there are none yet.
 | Build error naming `secrets.h` | You haven't copied `secrets.h.example` to `secrets.h` yet |
 | Phone will not join the setup hotspot | It is auto-reconnecting with the password from a previous session — the network name stays the same but the password does not. Most phones then say the password is wrong and let you type the new one; if yours does not, tell it to forget the network and join again. The chip's log shows the failure as `station ... leave, reason = 15` |
 | Setup form loads, but submitting it does nothing | Check the log for `431` / "request URI/header too long". `CONFIG_HTTPD_MAX_REQ_HDR_LEN` (in `sdkconfig.defaults`, raised to 2048) has to be large enough for a mobile browser's POST headers — the GET of the form fits in the 512-byte default and the POST does not |
-| The chip reboots whenever you close the serial monitor | Not a fault. This board is native USB-CDC, and the DTR/RTS toggle on opening *or* closing the port resets it. A test that spans a timeout needs one unbroken capture |
+| The chip reboots when you open or close the serial monitor | Not a fault. This board is native USB-CDC, and the DTR/RTS toggle a host does on open and close usually resets it — not every time, but often enough to assume it will. A test that spans a timeout needs one unbroken capture |
 | `disconnected (reason 201)` repeating | AP not found — wrong SSID, or the network is 5 GHz only |
 | `disconnected (reason 15)` or `(reason 2)` | Handshake failed — wrong password. A few `reason 2` retries *at startup* are normal and recover on their own |
 | `disconnected (reason 205)`, intermittent | Weak signal; check the antenna is attached to the XIAO |

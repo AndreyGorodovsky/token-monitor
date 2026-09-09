@@ -1,8 +1,12 @@
-/* Reading the runtime configuration. See config.h for what and why.
+/* The runtime configuration: reading it, and -- since provisioning stage 4 --
+ * writing it. See config.h for what and why.
  *
- * The whole file is the read half. There is deliberately no write half yet:
- * this stage changes only where the values come from, not who can set them,
- * so that "the gadget behaves exactly as before" is a meaningful test result.
+ * The read half came first and on its own, deliberately: stage 1 changed only
+ * where the values came from and not who could set them, so that "the gadget
+ * behaves exactly as before" was a meaningful test result. The write half is
+ * one function at the bottom, and it is the only code in the project that can
+ * destroy a working configuration -- which is why config.h spends most of its
+ * words on it.
  */
 
 #include <string.h>
@@ -167,10 +171,13 @@ void config_load(app_config_t *out)
 
     bool n_ssid = false, n_pass = false, n_host = false, n_port = false;
 
-    /* NVS_READONLY, because this stage genuinely never writes. Opening a
-     * namespace read-only that has never been created returns
-     * ESP_ERR_NVS_NOT_FOUND rather than creating it, which is exactly the
-     * behaviour we want on a chip that has only ever been flashed. */
+    /* NVS_READONLY even now that config_save exists, and for a better reason
+     * than "this function does not write": opening a namespace read-only that
+     * has never been created returns ESP_ERR_NVS_NOT_FOUND rather than
+     * creating it. A chip that has only ever been flashed therefore reads its
+     * defaults without leaving an empty namespace behind, and the "no 'cfg'
+     * namespace in nvs yet" line below stays truthful until something has
+     * actually been saved. */
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
     if (err == ESP_OK) {
@@ -204,6 +211,66 @@ void config_load(app_config_t *out)
              (unsigned)strlen(out->password), source(n_pass));
     ESP_LOGI(TAG, "  host     \"%s\" (from %s)", out->host, source(n_host));
     ESP_LOGI(TAG, "  port     %u (from %s)", (unsigned)out->port, source(n_port));
+}
+
+/* --- the write half (provisioning stage 4) ------------------------------- */
+
+esp_err_t config_save(const app_config_t *cfg, bool save_password)
+{
+    /* NVS_READWRITE, which unlike the read path DOES create the namespace if
+     * it is not there -- which is the case on every chip that has never been
+     * provisioned, i.e. the interesting one. */
+    nvs_handle_t h;
+    esp_err_t    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open for writing failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Each set is attempted only if everything before it worked, so the first
+     * error is the one reported and nothing is written on top of a failure.
+     * Note that none of these is durable until the commit below. */
+    err = nvs_set_str(h, KEY_SSID, cfg->ssid);
+
+    if (err == ESP_OK && save_password) {
+        err = nvs_set_str(h, KEY_PASS, cfg->password);
+    }
+    /* When save_password is false the key is simply not touched. Whatever it
+     * held stays: a password saved on an earlier visit, or nothing at all, in
+     * which case config_load falls back to secrets.h for that one value. Both
+     * are "keep the current password", which is what a blank field means. */
+
+    if (err == ESP_OK) { err = nvs_set_str(h, KEY_HOST, cfg->host); }
+    if (err == ESP_OK) { err = nvs_set_u16(h, KEY_PORT, cfg->port); }
+
+    if (err == ESP_OK) {
+        /* The moment it becomes real. nvs_set_* only stages a value; this is
+         * what guarantees it survives a power cut. One commit for all four
+         * means there is no window in which the SSID has changed and the host
+         * has not. */
+        err = nvs_commit(h);
+    }
+
+    nvs_close(h);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "saving the config failed: %s -- nothing was changed",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    /* Same rule as everywhere else: the password's presence, never its value.
+     * Saying which of the two branches ran is worth a line, because "I changed
+     * my WiFi password and it still uses the old one" is otherwise a mystery
+     * with no evidence either way. */
+    ESP_LOGI(TAG, "config saved to nvs:");
+    ESP_LOGI(TAG, "  ssid     \"%s\"", cfg->ssid);
+    ESP_LOGI(TAG, "  password %s", save_password
+                                     ? "replaced"
+                                     : "left as it was (field was blank)");
+    ESP_LOGI(TAG, "  host     \"%s\"", cfg->host);
+    ESP_LOGI(TAG, "  port     %u", (unsigned)cfg->port);
+    return ESP_OK;
 }
 
 bool config_is_complete(const app_config_t *cfg)

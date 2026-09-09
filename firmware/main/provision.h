@@ -5,11 +5,16 @@
  * reflashing. A three-second press on the D1 button now puts the gadget into
  * its own network, with a form you fill in from a phone.
  *
- * STAGE 3 SAVES NOTHING. The form renders, the submission is parsed,
- * validated and logged -- and then discarded, with the reply page saying so.
- * Writing to NVS is stage 4. The split is deliberate: a form that does not
+ * A submission that passes validation is written to NVS and applied by
+ * rebooting -- there is no attempt to reconfigure a running radio, because a
+ * reboot is the one path already known to produce a correctly configured chip.
+ * What is NOT done is checking the credentials before keeping them:
+ * verify-before-commit is stage 5, and it cannot be done from inside the
+ * request that would have to be answered afterwards.
+ *
+ * Stage 3 built this without the save, on purpose -- a form that does not
  * render and a save that does not stick are two different bugs, and finding
- * them one at a time is much faster than finding them together.
+ * them one at a time was much faster than finding them together.
  *
  * WHAT THE CALLER MUST DO FIRST. Becoming an AP means leaving station mode,
  * and esp_wifi_stop() on an associated station emits WIFI_EVENT_STA_DISCONNECTED
@@ -25,6 +30,8 @@
  * follows, and for the same reason.
  */
 #pragma once
+
+#include <stdbool.h>
 
 #include "esp_err.h"
 
@@ -59,7 +66,10 @@ typedef struct {
 /* Leave station mode, raise the hotspot, and start serving the form.
  *
  * `current` supplies the values the form is pre-filled with: the SSID, host
- * and port. The password in it is deliberately NOT used -- the form's password
+ * and port. On an unconfigured chip those are empty, which is fine and is the
+ * expected case -- the form comes up blank and waits to be told.
+ *
+ * The password in `current` is deliberately NOT used. The form's password
  * field is always blank, with "leave blank to keep current" under it, for the
  * same reason the token never leaves the PC. Nothing that can echo a stored
  * credential back over the network gets to exist.
@@ -73,3 +83,16 @@ typedef struct {
  * Do not call twice. There is one radio and one server.
  */
 esp_err_t provision_start(const app_config_t *current, provision_info_t *out);
+
+/* True once a submission has been accepted and written to NVS.
+ *
+ * The caller polls this rather than the server calling back, because the two
+ * things that have to happen next -- putting something on the panel, and
+ * rebooting -- both belong to the task that owns the display, and neither may
+ * happen on the server's task while it is still finishing a response. The flag
+ * is set only after the reply has gone out, so by the time the caller sees it
+ * the phone already has its confirmation page.
+ *
+ * Never clears. A save is the end of setup mode; the reboot is what resets it.
+ */
+bool provision_saved(void);

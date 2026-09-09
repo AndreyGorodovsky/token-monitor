@@ -21,6 +21,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_err.h"                 /* esp_err_t, returned by config_save */
+
 /* Sizes come straight from the 802.11 standard and are +1 for the NUL.
  *
  * The SSID field on the air is a length-counted array, not a C string, so a
@@ -59,5 +61,35 @@ void config_load(app_config_t *out);
  * and a non-zero port. A blank password is deliberately allowed -- that is a
  * legitimate open network, not a missing value.
  *
- * A false return is what will trigger setup mode once the portal exists. */
+ * A false return sends the chip into setup mode: there is nothing else it
+ * could usefully do, and asking to be configured is the only way out. */
 bool config_is_complete(const app_config_t *cfg);
+
+/* Write the configuration to NVS, where the next boot will find it.
+ *
+ * `save_password` is the whole reason this takes a flag rather than just a
+ * struct. The setup form's password field is deliberately blank, meaning
+ * "keep whatever is already stored", and the difference between that and "set
+ * the password to nothing" cannot be expressed by an empty string -- an empty
+ * password is *also* a legitimate value, for an open network. So the caller
+ * says which it meant. False leaves the stored key untouched, whatever it
+ * held, including nothing at all.
+ *
+ * All four values go in under a single nvs_commit(), which is the point at
+ * which any of them become durable. Lose power before it and the old
+ * configuration is intact; lose power after it and the new one is. There is no
+ * in-between state where half the settings changed -- which matters because
+ * this is the one operation in the project that can destroy a working config.
+ *
+ * Even so the per-key fallback in config_load() is still the safety net worth
+ * having: should a key ever end up missing or unreadable, that value falls
+ * back to secrets.h on its own rather than taking the other three down with
+ * it.
+ *
+ * Returns ESP_OK, or the first NVS error encountered. On failure the caller
+ * should assume nothing was written and say so -- silently continuing would
+ * leave someone believing they had reconfigured a chip that they had not.
+ *
+ * nvs_flash_init() must have been called first.
+ */
+esp_err_t config_save(const app_config_t *cfg, bool save_password);

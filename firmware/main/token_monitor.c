@@ -1705,13 +1705,34 @@ static void enter_setup_mode(void)
 
     render_setup(&info);
 
+    /* Whether the timeout applies at all.
+     *
+     * The five minutes exist to put the gadget back to work after a press
+     * nobody followed up on. A chip with no usable configuration has no work
+     * to go back TO: timing out would reboot it into a state whose only
+     * correct response is to enter setup mode again, i.e. a screen that
+     * reboots itself every five minutes forever. So an unconfigured chip
+     * stays here until someone either fills in the form or holds the button.
+     *
+     * Read once rather than per iteration, because it cannot change while
+     * this loop runs -- the save that would change it also ends the loop. */
+    const bool has_config = config_is_complete(&s_cfg);
+
     const int64_t deadline_us =
         esp_timer_get_time() + (int64_t)SETUP_TIMEOUT_MS * 1000;
     const char *why = "timed out";
 
     while (1) {
         int64_t left_us = deadline_us - esp_timer_get_time();
-        if (left_us <= 0) {
+        if (has_config && left_us <= 0) {
+            break;
+        }
+
+        /* The submitted form landed. provision.c has already answered the
+         * phone by the time this flag is visible, so rebooting now cannot
+         * cost anyone their confirmation page. */
+        if (provision_saved()) {
+            why = "settings saved";
             break;
         }
 
@@ -1720,8 +1741,14 @@ static void enter_setup_mode(void)
          * The + 59999999 is that rounding-up done in integer arithmetic --
          * there are 60000000 microseconds in a minute, and adding one less
          * than that before dividing carries any remainder up to the next
-         * whole minute. */
-        render_setup_minutes((int)((left_us + 59999999) / 60000000));
+         * whole minute.
+         *
+         * With no config there is no deadline, so the row stays empty rather
+         * than counting down to something that will not happen. An empty row
+         * is the honest thing to draw: this screen is not going anywhere. */
+        if (has_config) {
+            render_setup_minutes((int)((left_us + 59999999) / 60000000));
+        }
 
         /* The same bit, and the same three-second hold, that got us in here.
          * pdTRUE clears it on the way out -- unlike the main loop, which
@@ -1737,7 +1764,17 @@ static void enter_setup_mode(void)
     }
 
     ESP_LOGI(TAG, "leaving setup mode (%s) -- restarting", why);
-    render_message("RESTARTING", NULL);
+
+    /* Two different things worth saying. After a save the reboot is the last
+     * step of something that worked, and "SAVED" is what someone standing
+     * there wants confirmed by the device itself rather than only by a page on
+     * their phone. After a timeout or a second press, nothing changed, and
+     * claiming otherwise would be the worst kind of wrong. */
+    if (provision_saved()) {
+        render_message("SAVED", "RESTARTING");
+    } else {
+        render_message("RESTARTING", NULL);
+    }
 
     /* Long enough to read, and long enough that a finger still on the button
      * from the exit press has usually let go before the chip boots. It is only
@@ -1831,13 +1868,21 @@ static void usage_task(void *arg)
          * deliberately, because app_main's explanation has long scrolled past
          * by the time anyone attaches a monitor. */
         if (!config_is_complete(&s_cfg)) {
+            /* Stage 4 turns this from a dead end into the way in. Before the
+             * portal existed the only honest thing to do was say NO CONFIG and
+             * wait for someone to attach a serial monitor; now the chip can
+             * ask to be configured, so it does, without needing to be told.
+             *
+             * This is also what makes a freshly flashed chip usable by someone
+             * who never edits secrets.h at all: power it on, and it comes up
+             * as a hotspot asking for the four values.
+             *
+             * No timeout applies in there -- see enter_setup_mode -- so this
+             * cannot become a reboot loop. And it never returns, so nothing
+             * below runs until the chip has restarted with a configuration. */
             ESP_LOGW(TAG, "config incomplete -- ssid, host and port must all "
-                          "be set; not connecting or polling");
-            render_message("NO CONFIG", "SEE SERIAL");
-            xEventGroupWaitBits(s_events, BUTTON_SETUP_BIT,
-                                pdFALSE, pdFALSE,
-                                pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
-            continue;
+                          "be set; entering setup mode to ask for them");
+            enter_setup_mode();          /* does not return */
         }
 
         /* Ask the radio before spending a ten-second HTTP timeout discovering
@@ -2063,7 +2108,9 @@ void app_main(void)
          * precisely beats letting it present as an endless "reason 201" WiFi
          * failure, which sends you off to debug the wrong thing entirely. */
         ESP_LOGE(TAG, "config incomplete: ssid, host and port must all be set");
-        ESP_LOGE(TAG, "fill in main/secrets.h and reflash, or provision over nvs");
+        ESP_LOGI(TAG, "the chip will raise its setup hotspot shortly -- join it "
+                      "and fill in the form; secrets.h and a reflash are no "
+                      "longer the only way");
     }
 
     /* --- stage 6: the display, before anything network-shaped -------------
@@ -2113,7 +2160,12 @@ void app_main(void)
     if (config_is_complete(&s_cfg)) {
         render_message("CONNECTING", NULL);
     } else {
-        render_message("NO CONFIG", "SEE SERIAL");
+        /* On screen for a moment only: usage_task starts next, finds the same
+         * thing, and takes the chip into setup mode. Saying SETUP rather than
+         * SEE SERIAL because that is now what actually happens, and because a
+         * gadget that tells you to go and find a USB cable is the problem this
+         * whole branch exists to remove. */
+        render_message("NO CONFIG", "SETUP...");
     }
     ESP_LOGI(TAG, "display ready");
 

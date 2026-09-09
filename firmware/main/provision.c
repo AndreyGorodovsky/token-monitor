@@ -1,4 +1,5 @@
-/* Setup mode. See provision.h for the contract and what stage 3 does not do.
+/* Setup mode: the hotspot, the form, and -- since stage 4 -- the save.
+ * See provision.h for the contract.
  *
  * THE IDEA IN ONE PARAGRAPH. A WiFi chip can be a *station* -- a client that
  * joins somebody else's network, which is what this gadget does all day -- or
@@ -17,8 +18,8 @@
  *                               that the display's font can actually draw
  *   3. the form              -- the HTML, the escaping, and why the pages are
  *                               streamed rather than built in a buffer
- *   4. reading the submission -- url-decoding, validation, and the reply that
- *                               says plainly that nothing was saved
+ *   4. reading the submission -- url-decoding, validation, the write to NVS,
+ *                               and the reply that says what happened
  *   5. provision_start()     -- the swap itself, in dependency order
  * ---------------------------------------------------------------------------
  *
@@ -29,10 +30,13 @@
  * handler must not block for long: while one is running, no other request is
  * being served.
  *
- * What is deliberately absent: any write to NVS (stage 4), any DNS responder
- * (decided against for v1 -- this gadget has a screen and can simply tell you
- * the URL), and any call into gc9a01. The panel belongs to usage_task; this
- * module reports, and lets the caller draw.
+ * What is deliberately absent: any check that the submitted credentials
+ * actually work before keeping them (verify-before-commit is stage 5), any DNS
+ * responder (decided against for v1 -- this gadget has a screen and can simply
+ * tell you the URL), and any call into gc9a01. The panel belongs to
+ * usage_task; this module reports, and lets the caller draw. That includes the
+ * restart after a save: this file writes the values and sets a flag, and the
+ * caller decides when to reboot.
  */
 
 #include <string.h>                  /* memcpy, strlen, strncmp, strchr      */
@@ -76,6 +80,24 @@ static struct {
     char     host[CFG_HOST_CAP];
     uint16_t port;
 } s_form;
+
+/* Set by save_post once a submission has been written to NVS, read by the
+ * caller's loop. Deliberately not cleared and deliberately one-way: a save
+ * ends setup mode, and the reboot is what resets it.
+ *
+ * `volatile` because it is written on the server's task and read on
+ * usage_task. A single aligned bool needs nothing stronger than that here --
+ * there is one writer, one reader, and no other state whose ordering matters
+ * to them. Note that s_form is NOT updated to match a save: the chip is about
+ * to reboot, and config_load() at the next boot is the one place that decides
+ * what the current configuration is. Two answers to that question is exactly
+ * the sort of thing that drifts. */
+static volatile bool s_saved;
+
+bool provision_saved(void)
+{
+    return s_saved;
+}
 
 /* --- 2. the hotspot's identity ------------------------------------------- */
 
@@ -592,38 +614,71 @@ static esp_err_t save_post(httpd_req_t *req)
     /* The password's LENGTH, never the password itself. Same rule as config.c:
      * a value one character short is a real failure worth being able to see,
      * and the length makes it visible while giving away nothing worth having. */
+    const bool keep_password = (pass[0] == '\0');
+
     ESP_LOGI(TAG, "form submitted:");
     ESP_LOGI(TAG, "  ssid     \"%s\"", ssid);
     ESP_LOGI(TAG, "  password %u chars%s", (unsigned)strlen(pass),
-             (pass[0] == '\0') ? " (blank -- would keep the current one)" : "");
+             keep_password ? " (blank -- keeping the current one)" : "");
     ESP_LOGI(TAG, "  host     \"%s\"", host);
     ESP_LOGI(TAG, "  port     %ld", port);
-    ESP_LOGW(TAG, "NOT SAVED -- writing to nvs is stage 4; nothing changed");
 
-    /* The reply says plainly that nothing was saved. A page that said "Saved!"
-     * while discarding the values would be the most misleading screen in the
-     * project: someone would reboot, find the old settings, and go hunting for
-     * a bug in an NVS write that does not exist yet. */
+    /* Everything above this line has only read. Everything below can change
+     * what the gadget is, which is the whole of stage 4 and the first time
+     * this project has been able to lose a working configuration.
+     *
+     * Note what is NOT attempted here: joining the network to check the
+     * credentials before keeping them. Verify-before-commit is stage 5, and
+     * doing it now would mean tearing the AP down mid-request, with the person
+     * who submitted the form watching a page that can no longer be answered.
+     * So this saves what it was told, and a wrong password is discovered the
+     * ordinary way -- on the next boot, on the screen, with the button still
+     * there to try again. */
+    app_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.ssid,     sizeof(cfg.ssid),     "%s", ssid);
+    snprintf(cfg.password, sizeof(cfg.password), "%s", pass);
+    snprintf(cfg.host,     sizeof(cfg.host),     "%s", host);
+    cfg.port = (uint16_t)port;
+
+    esp_err_t serr = config_save(&cfg, !keep_password);
+    if (serr != ESP_OK) {
+        /* Say so on the page rather than only in the log. Someone who has just
+         * typed their WiFi password into a phone and been told nothing would
+         * reasonably assume it worked, walk away, and find a chip that still
+         * cannot connect -- with the one piece of evidence sitting in a serial
+         * log they are not watching. */
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "Saving to the chip failed (%s). Nothing was changed, so the "
+                 "gadget still has its previous settings.",
+                 esp_err_to_name(serr));
+        return send_problem(req, msg);
+    }
+
     char esc[ESCAPED_CAP(CFG_HOST_CAP)];
     char num[24];
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_sendstr_chunk(req, PAGE_HEAD);
     httpd_resp_sendstr_chunk(req,
-        "<h1>Received</h1>"
-        "<div class=\"note\"><b>Nothing was saved.</b> This build parses and "
-        "reports the form; writing the values is the next stage.</div>"
+        "<h1>Saved</h1>"
+        "<div class=\"note\">The gadget is restarting now to use these "
+        "settings. Its hotspot will disappear in a few seconds &mdash; that is "
+        "the restart, not a fault, and your phone will drop back to your "
+        "normal network.</div>"
         "<p>WiFi network: <b>");
 
     html_escape(ssid, esc, sizeof(esc));
     send_value(req, esc);
 
     httpd_resp_sendstr_chunk(req, "</b><br>WiFi password: <b>");
-    snprintf(num, sizeof(num), "%u characters", (unsigned)strlen(pass));
-    send_value(req, num);
-    httpd_resp_sendstr_chunk(req, "</b>");
-    if (pass[0] == '\0') {
-        httpd_resp_sendstr_chunk(req, " (blank &mdash; would keep the current one)");
+    if (keep_password) {
+        httpd_resp_sendstr_chunk(req, "unchanged</b>");
+    } else {
+        snprintf(num, sizeof(num), "%u characters", (unsigned)strlen(pass));
+        send_value(req, num);
+        httpd_resp_sendstr_chunk(req, "</b>");
     }
 
     httpd_resp_sendstr_chunk(req, "<br>PC address: <b>");
@@ -635,9 +690,17 @@ static esp_err_t save_post(httpd_req_t *req)
     send_value(req, num);
 
     httpd_resp_sendstr_chunk(req,
-        "</b></p><p><a href=\"/\">Back to the form</a></p>");
+        "</b></p><p>If the numbers do not come back on the screen in a minute, "
+        "hold the button for three seconds and check the settings.</p>");
     httpd_resp_sendstr_chunk(req, PAGE_TAIL);
     httpd_resp_sendstr_chunk(req, NULL);
+
+    /* Only now. The caller reboots within about a second of seeing this, so
+     * setting it before the reply had gone out would race the restart against
+     * the page and, on a bad day, lose -- leaving someone looking at a browser
+     * error after a save that actually succeeded. */
+    s_saved = true;
+    ESP_LOGI(TAG, "saved -- restarting to apply");
     return ESP_OK;
 }
 

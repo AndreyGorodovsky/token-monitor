@@ -25,16 +25,20 @@ key. Two consequences worth stating plainly:
   not a downgrade — a compiled-in `#define` was equally readable in the
   binary — but it is now a second place the value exists, and moving the
   gadget on to someone else means erasing it (`idf.py erase-flash`) rather
-  than just not handing over `secrets.h`.
-- **The repo builds without any credential — but is not yet
-  clone-and-flash.** Because `secrets.h` is optional, nothing about
-  publishing this repository requires a reader to receive, or invent, any
-  secret to get a *building* image. Getting a *working* one still needs a
-  `secrets.h`, because the setup portal that would let a reader provision the
-  chip over WiFi does not exist yet: today the only other way in is
-  hand-generating an NVS image with `nvs_partition_gen.py`. Revisit this
-  sentence when the portal lands — it is the thing that makes the claim
-  true.
+  than just not handing over `secrets.h`. Since provisioning stage 4 this is
+  the ordinary case rather than the exception: the setup form writes the WiFi
+  password to NVS whenever the field is filled in, so most provisioned chips
+  hold one there. A blank field leaves the stored key untouched, so a chip can
+  still be running on a `secrets.h` password with everything else from NVS.
+- **The repo is now clone-and-flash.** Because `secrets.h` is optional,
+  nothing about publishing this repository requires a reader to receive, or
+  invent, any secret to get a *building* image — and since provisioning stage
+  4 the same is true of a *working* one. A chip flashed with no `secrets.h`
+  comes up with an empty configuration, raises its setup hotspot on its own,
+  and takes the four values from a phone. `secrets.h` and the
+  `nvs_partition_gen.py` route both still work; neither is required any more.
+  This bullet spent three stages saying the opposite, which is what the
+  "revisit when the portal lands" note in it was for.
 
 "Nowhere" in that row takes one deliberate call to stay true, and it is worth
 knowing which. `esp_wifi` defaults to `WIFI_STORAGE_FLASH`, so

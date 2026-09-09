@@ -602,6 +602,41 @@ static esp_err_t save_post(httpd_req_t *req)
         return send_problem(req, "The PC address cannot be empty.");
     }
 
+    /* Changing the network while leaving the password blank.
+     *
+     * "Blank means keep the current password" is exactly right when the
+     * network is not changing, and a trap when it is: the chip would save the
+     * new SSID against the old network's password, fail the handshake on the
+     * next boot, and present as a mistyped name. The person would then most
+     * likely retype the name -- the one thing that is not wrong.
+     *
+     * The comparison is free: s_form.ssid already holds what the pre-fill
+     * showed. Note it cannot misfire on the ordinary case, because an
+     * unchanged SSID compares equal and a blank password stays permitted --
+     * which is what "just fix the PC address" needs.
+     *
+     * The `s_form.ssid[0] != 0` test is not redundant, and leaving it out was
+     * the first version of this check. On an UNCONFIGURED chip the stored SSID
+     * is "", so every name differs from it and a blank password would be
+     * refused -- which would make it impossible to provision an open network
+     * on a fresh chip, the one case where a blank password is unambiguous:
+     * there is no stored password for "keep the current one" to refer to.
+     *
+     * The mirror of that case is a real limitation rather than a bug, and it
+     * has nowhere better to live than this comment: a chip that already has a
+     * network cannot be moved to an OPEN one from this form, because a blank
+     * field means "keep" there and there is no way to say "none". It needs a
+     * "this network has no password" checkbox, which belongs with stage 5's
+     * polish. Home networks that are genuinely open are rare enough, and
+     * inadvisable enough, that this is not worth a field of its own today. */
+    if (pass[0] == '\0' && s_form.ssid[0] != '\0' &&
+        strcmp(ssid, s_form.ssid) != 0) {
+        return send_problem(req,
+            "You changed the WiFi network, so its password is needed too. "
+            "Leaving the password blank keeps the one already stored, which "
+            "belongs to the previous network.");
+    }
+
     /* strtol rather than atoi, which cannot tell "0" from "not a number at
      * all" -- and 0 is exactly the value config.h reads as "unset", so a typo
      * would present later as a chip that thinks it was never configured. */

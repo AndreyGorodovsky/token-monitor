@@ -64,7 +64,7 @@ Five stages. **1 through 4 are done and verified on hardware; 5 is next.**
 | 2 — the button on D1, debounced, long-press detected | **done** (`1ec88e9`) |
 | review pass — six findings, all real | **done** (`5c800ef`) |
 | 3 — SoftAP + HTML form, submissions logged but NOT saved | **done** — verified end to end on hardware |
-| 4 — save to NVS, reboot to apply, empty config enters setup | **done** — the save and the reboot verified on hardware; the empty-config path not yet |
+| 4 — save to NVS, reboot to apply, empty config enters setup | **done** — all three verified on hardware, including a chip with nothing at all |
 | 5 — polish: verify-before-commit, SSID scan dropdown, captive portal | **next** |
 
 ### Decisions already made — don't re-litigate these
@@ -329,11 +329,66 @@ so the `pass` key was never written, and `config_load` fell back to `secrets.h`
 for that one value while taking the other three from NVS. Per-key fallback,
 demonstrated on a real save rather than argued about.
 
-**What is not yet verified: the empty-config path.** "Empty config enters
-setup" needs a chip with nothing in NVS, which means erasing the config that
-was just proved to work. Worth doing deliberately -- it is also the only way to
-exercise the empty-pre-fill case behind the review's `send_value` fix, since a
-blank SSID is exactly what renders it.
+**Then the harder test: a chip with nothing at all.** "Empty config enters
+setup" cannot be reached by erasing NVS alone -- `secrets.h` would still supply
+all four values, and the config would still be complete. It needs a build with
+no `secrets.h` *and* an erased NVS: the ccache trap in reverse, handled the
+documented way (move `secrets.h` out of the tree, `idf.py fullclean`,
+`CCACHE_RECACHE=1 idf.py build`). The result was checked by grepping the binary
+for the SSID, password and host before flashing -- all three absent -- and then
+`idf.py erase-flash`.
+
+That chip came up in setup mode by itself, served a **completely blank** form,
+took all four values from a phone, and rebooted into:
+
+```
+config:   ssid     "<your-network>" (from nvs)
+config:   password 10 chars         (from nvs)
+config:   host     "192.168.1.87"   (from nvs)
+config:   port     8734             (from nvs)
+polling http://192.168.1.87:8734/usage every 45 s
+status 200, content-length 279
+```
+
+Four things proved at once, which is what made the erase worth it:
+
+- **Empty config enters setup**, the last of stage 4's three deliverables.
+- **The review's `send_value` fix**, until then the one outstanding unverified
+  fix on this branch. A blank SSID is exactly the empty pre-fill that would
+  otherwise have ended the page at `<input name="ssid" value="`, with no Save
+  button to submit. The form rendered, and submitted.
+- **Changing networks works** -- this typed in a network name and password
+  from scratch rather than editing an address.
+- **`password replaced` / `(from nvs)`**, the other branch of `config_save`'s
+  flag from the first test's `left as it was (field was blank)`. Both paths are
+  now exercised on hardware.
+
+`secrets.h` was restored and the chip reflashed afterwards, so the tree and the
+board match again. The chip is still running entirely on values typed into a
+phone -- NVS wins per key, and there is nothing in `secrets.h` it needs.
+
+### A blank password with a changed SSID is refused
+
+"Blank means keep the current password" is right when the network is not
+changing, and a trap when it is: the chip would save the new SSID against the
+old network's password, fail the handshake on the next boot, and present as a
+mistyped name -- so the person retypes the one thing that was not wrong.
+
+`save_post` refuses that combination, comparing against the SSID it already
+holds for the pre-fill. Two details keep it from misfiring:
+
+- An **unchanged** SSID with a blank password is still allowed. That is the
+  ordinary "just fix the PC address" case, and it has to stay a two-field edit.
+- An **unconfigured** chip is exempt, because there is no stored password for
+  "keep the current one" to refer to, so a blank field there unambiguously
+  means an open network. Leaving that exemption out was the first version of
+  this check, and it would have made a fresh chip unable to join an open
+  network at all.
+
+The mirror case is a limitation rather than a bug: a chip that already has a
+network cannot be moved to an **open** one from this form, because a blank
+field means "keep" there and there is no way to say "none". That wants a "this
+network has no password" checkbox, which belongs with stage 5.
 
 ### The hotspot's name stays the same every time — settled
 

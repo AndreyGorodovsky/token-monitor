@@ -77,6 +77,13 @@ field blank — leave it blank to keep the one already stored. Submitting it
 saves the values and restarts the chip to use them; the page says so, and the
 panel shows `SAVED`.
 
+**Moving to a different WiFi network** works from here too, and you do not need
+the old network to do it — the form is served over the chip's own hotspot, and
+the button is heard even when the chip cannot connect to anything. Fill in the
+new network name *and* its password. Leaving the password blank while changing
+the name is refused, with an explanation: blank means "keep the stored
+password", which belongs to the network you are leaving.
+
 To leave without changing anything: hold the button for three seconds again, or
 do nothing for five minutes. Both reboot the chip. **Entering setup mode
 deletes nothing**, so an accidental press, a timeout, or pulling the power all
@@ -353,6 +360,7 @@ over the last known numbers, or a `NO DATA` screen if there are none yet.
 | Text mirrored, upside down, or rotated | Also `madctl`, but the scan-direction bits rather than colour: `0x40` MX flips horizontally, `0x80` MY vertically, `0x20` MV rotates 90°. Solid-colour tests cannot reveal this — only asymmetric content can |
 | Screen lit but streaky, noisy, or partial | Signal integrity — most likely the 40 MHz SPI clock over long jumper wires, or a loose SCL/SDA/DC line. `SPI_CLOCK_HZ` in `gc9a01.c` was 10 MHz through stage 7 and is the first thing to put back |
 | Build error naming `secrets.h` | You haven't copied `secrets.h.example` to `secrets.h` yet |
+| Form refuses with "You changed the WiFi network, so its password is needed too" | Working as intended. A blank password field means "keep the stored one", so changing the network name and leaving it blank would save the new name against the old network's password. Type the new network's password |
 | Phone will not join the setup hotspot | It is auto-reconnecting with the password from a previous session — the network name stays the same but the password does not. Most phones then say the password is wrong and let you type the new one; if yours does not, tell it to forget the network and join again. The chip's log shows the failure as `station ... leave, reason = 15` |
 | Setup form loads, but submitting it does nothing | Check the log for `431` / "request URI/header too long". `CONFIG_HTTPD_MAX_REQ_HDR_LEN` (in `sdkconfig.defaults`, raised to 2048) has to be large enough for a mobile browser's POST headers — the GET of the form fits in the 512-byte default and the POST does not |
 | The chip reboots when you open or close the serial monitor | Not a fault. This board is native USB-CDC, and the DTR/RTS toggle a host does on open and close usually resets it — not every time, but often enough to assume it will. A test that spans a timeout needs one unbroken capture |

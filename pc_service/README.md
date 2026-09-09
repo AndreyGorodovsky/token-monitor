@@ -97,6 +97,58 @@ normally are. Guest WiFi networks, mesh systems in certain modes, and
 "client isolation" / "AP isolation" settings deliberately break this, and no
 firewall rule fixes it.
 
+## Finding this machine's address
+
+The gadget needs the PC's address on the local network, and there are three
+ways to get it — in increasing order of usefulness.
+
+**Just read it off this service.** Since it knows, it now says so at startup:
+
+```
+14:45:32  serving GET /usage on 0.0.0.0:8899  (Ctrl-C to stop)
+14:45:32  reachable on this network at 192.168.1.87:8899 -- that is the address to give the gadget
+```
+
+That second line is the value to type into the setup form (or into
+`firmware/main/secrets.h`). It is worked out by asking the OS which interface
+it would use to reach the outside world — not by resolving the hostname, which
+on a machine with a VM host network, a VPN or WSL commonly answers with the
+wrong adapter. Nothing is sent to reach that answer. Started with
+`--host 127.0.0.1`, it says instead that it is local-only and the gadget cannot
+reach it at all.
+
+**Windows, without this service running:**
+
+```powershell
+# just the adapter that carries internet traffic
+(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway }).IPv4Address.IPAddress
+
+# or the old way, and read the "IPv4 Address" under your active adapter
+ipconfig
+```
+
+`ipconfig` lists every adapter, including virtual ones from VirtualBox, Hyper-V
+or WSL, which is exactly the confusion the first command avoids. Ignore
+anything starting `169.254.` — that is a link-local address, meaning the
+adapter never got a real one.
+
+**Linux:** `ip -4 addr show` for everything, or
+`ip route get 1.1.1.1 | awk '{print $7; exit}'` for the same
+which-interface-would-I-use answer the service gives.
+
+The address you want is the one on the same network as the gadget — normally
+`192.168.x.y` or `10.x.y.z`.
+
+**But the real answer is not to look it up at all**, because it moves: this
+machine was `192.168.1.87`, then `.88`, then `.87` again across two days of
+testing. Two ways to stop caring:
+
+- **Change it from the gadget when it moves.** Hold the setup button for three
+  seconds, join the hotspot, put the new address in the form. Ninety seconds,
+  no cable. This is what the provisioning work exists for.
+- **Stop it moving at all** — a DHCP reservation on the router, described next.
+  This is the permanent fix, and it is worth doing once.
+
 ## Keeping the address stable
 
 The firmware finds this service through `PC_SERVICE_HOST` in

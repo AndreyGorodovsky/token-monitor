@@ -35,6 +35,7 @@ Then: curl http://<this-pc-lan-ip>:8734/usage
 import argparse
 import datetime
 import json
+import socket
 import sys
 import threading
 import time
@@ -400,6 +401,40 @@ class UsageHandler(BaseHTTPRequestHandler):
         log(f"{self.client_address[0]} {fmt % args}")
 
 
+def lan_address():
+    """The address other machines on the network should use to reach us.
+
+    Worth having because "0.0.0.0" -- what this service binds to and used to
+    announce -- says "every interface" and answers nobody's actual question,
+    which is what to type into the gadget. And the answer moves: a router that
+    hands out addresses by DHCP can pick a different one after a reboot or a
+    lease expiry, and this machine has been both .87 and .88 within two days.
+
+    The UDP socket is the standard trick for asking the OS which interface it
+    would use to reach the outside world, and reading the answer off the
+    socket. Nothing is sent -- connect() on a UDP socket only fixes the route,
+    it does not put a packet on the wire, so this works with the network
+    unplugged from the internet and costs nothing. 8.8.8.8 is a destination,
+    not a service being contacted.
+
+    The alternative, socket.gethostbyname(socket.gethostname()), is the
+    obvious-looking one and is wrong on exactly the machines where this matters:
+    with several adapters -- a VM host network, a VPN, WSL -- it commonly
+    returns whichever one the hostname happens to resolve to, which need not be
+    the one carrying LAN traffic.
+
+    Returns None rather than guessing if there is no route at all.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Serve Claude usage to the LAN.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -426,6 +461,23 @@ def main():
     threading.Thread(target=poll_forever, args=(cache,), daemon=True).start()
 
     log(f"serving GET /usage on {args.host}:{args.port}  (Ctrl-C to stop)")
+
+    # The line that saves a trip to ipconfig. This is the value to put in the
+    # gadget's setup form, or in firmware/main/secrets.h -- and because DHCP
+    # can move it, it is worth re-reading here rather than remembering what it
+    # was last week.
+    if args.host in ("0.0.0.0", ""):
+        ip = lan_address()
+        if ip:
+            log(f"reachable on this network at {ip}:{args.port} "
+                f"-- that is the address to give the gadget")
+        else:
+            log("could not work out this machine's LAN address; "
+                "check with `ipconfig` (Windows) or `ip addr` (Linux)")
+    else:
+        log(f"bound to {args.host} only -- reachable from this machine, "
+            f"not from the gadget" if args.host.startswith("127.")
+            else f"bound to {args.host} only")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

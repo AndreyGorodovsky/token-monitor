@@ -13,8 +13,8 @@ gauge arcs" below.
 **You are on the `wifi-provisioning` branch**, where a follow-on feature is
 half built: a button that puts the chip into a WiFi hotspot serving a setup
 form, so changing networks or PC address stops requiring an editor, a
-toolchain and a USB cable. Stages 1 and 2 of 5 are done and verified;
-**stage 3 is next**. See "WiFi provisioning" below, which is the section to
+toolchain and a USB cable. Stages 1, 2 and 3 of 5 are done and verified;
+**stage 4 is next**. See "WiFi provisioning" below, which is the section to
 read first when resuming on this branch. `main` is untouched and still holds
 the finished eight-stage build.
 
@@ -53,7 +53,7 @@ address, means editing `secrets.h` and rebuilding and reflashing. The goal is
 a button that puts the chip into its own WiFi hotspot serving a setup form,
 so the four settings can be changed from a phone in about ninety seconds.
 
-Five stages. **1 and 2 are done and verified on hardware; 3 is next.**
+Five stages. **1, 2 and 3 are done and verified on hardware; 4 is next.**
 
 | Stage | State |
 |---|---|
@@ -61,8 +61,8 @@ Five stages. **1 and 2 are done and verified on hardware; 3 is next.**
 | 1 — config read from NVS, secrets.h as fallback | **done** (`19811ee`) |
 | 2 — the button on D1, debounced, long-press detected | **done** (`1ec88e9`) |
 | review pass — six findings, all real | **done** (`5c800ef`) |
-| 3 — SoftAP + HTML form, submissions logged but NOT saved | **next** |
-| 4 — save to NVS, reboot to apply, empty config enters setup | not started |
+| 3 — SoftAP + HTML form, submissions logged but NOT saved | **done** — verified end to end on hardware |
+| 4 — save to NVS, reboot to apply, empty config enters setup | **next** |
 | 5 — polish: verify-before-commit, SSID scan dropdown, captive portal | not started |
 
 ### Decisions already made — don't re-litigate these
@@ -100,23 +100,89 @@ Five stages. **1 and 2 are done and verified on hardware; 3 is next.**
   button in its own group would be ignored during exactly the situation where
   you are most likely to press it.
 
-### What stage 3 does
+### Stage 3 as built
 
 Long press → stop station mode, start SoftAP, start `esp_http_server`, serve
 one form at `192.168.4.1` pre-filled with the current SSID and host/port.
 Submitting **logs the values and saves nothing**; the write path is stage 4.
 Leave via the second long press or a 5-minute timeout, both `esp_restart()`.
 
-Three things it has to get right:
+Two files. `provision.c` owns the radio switch, the AP and the HTTP server;
+`token_monitor.c` owns the way in, the screen, and the way out. The split
+follows the rule the button already follows: `provision.c` never calls
+`gc9a01`, because the panel belongs to `usage_task`. It hands the network
+name, password and URL back to its caller, and the caller draws them.
 
-- **Suppress the station reconnect logic while in setup mode.**
-  `on_wifi_event` treats every `STA_DISCONNECTED` as "ask again", with a
-  backoff timer. Stopping station mode to become an AP fires that event, so
-  without a flag the reconnect logic fights the mode switch.
-- **Never render the stored password back into the form.** Blank field,
-  "leave blank to keep current". Same discipline as never logging a token.
-- `esp_http_server` goes into `main/CMakeLists.txt`'s `REQUIRES`. That is
-  what the stage-0 partition bump was for.
+The three things it had to get right, and how they came out:
+
+- **Suppressing the station reconnect logic.** `on_wifi_event` treats every
+  `STA_DISCONNECTED` as "ask again", with a backoff timer, and stopping station
+  mode to become an AP fires exactly that event. `s_setup_mode` gates three
+  places, not one: the disconnect handler, the reconnect timer callback, and
+  the callback's own re-arm path — that last one because the flag can be set
+  while `esp_wifi_connect()` is already running, which is the likeliest way
+  that branch is reached during a mode switch. On hardware the log says
+  `station stopped for setup mode (reason 8), not retrying`, and there is no
+  reconnect chatter for the rest of the session.
+- **Never rendering the stored password back into the form.** Structural
+  rather than careful: `provision.c` copies the SSID, host and port into its
+  own `s_form` and *not* the password, so no bug in a handler can echo a value
+  it does not have. The field is blank with "leave blank to keep current", and
+  a blank submission is reported as "would keep the current one" rather than as
+  an empty password.
+- **`esp_http_server` in `REQUIRES`.** Done, and the stage-0 partition bump
+  paid for it: the binary is 0xf82c0 with 34% of the 1.5 MB partition free.
+
+**Verified on hardware, every path.** Entry: `entering setup mode` →
+`station stopped for setup mode (reason 8), not retrying` → the hotspot up,
+with the name and password on the panel matching the serial log. A phone
+joined, took a DHCP lease, loaded the form, and submitted it:
+
+```
+provision: form submitted:
+provision:   ssid     "<your-network>"
+provision:   password 0 chars (blank -- would keep the current one)
+provision:   host     "192.168.1.88"
+provision:   port     8734
+provision: NOT SAVED -- writing to nvs is stage 4; nothing changed
+```
+
+which also proves the pre-fill reads both sources: the SSID came from
+`secrets.h` and `192.168.1.88:8734` from NVS, per key, exactly as stage 1
+built it. Both exits were exercised separately: the second long press
+(`leaving setup mode (second long press)`) and, on its own six-minute run, the
+timeout — `leaving setup mode (timed out)` at 383960 ms against an entry at
+82700 ms, i.e. 301.3 s, five minutes plus one tick of the countdown's
+one-second granularity. Both ended in `rst:0xc (RTC_SW_CPU_RST)`, and the boot
+after the timeout printed the original four settings back unchanged. That last
+detail is the one worth keeping: five minutes in setup mode cost the chip
+nothing, which is what makes an accidental press harmless.
+
+Decisions worth not re-litigating:
+
+- **The AP password comes from a 26-character alphabet, not the printable
+  set.** The panel's font covers ASCII 32..90 and maps lowercase to uppercase,
+  so a password containing a lowercase letter would display as something
+  untypeable — the screen lying about a credential. `O/0`, `I/1`, `S/5`, `B/8`
+  and `Z/2` are dropped too, because this is read off a small round screen and
+  a password that fails once is worse than one two characters shorter.
+  Rejection sampling rather than modulo, so no character is likelier than
+  another.
+- **Both pages are assembled as HTTP chunks, not `snprintf`'d into a buffer.**
+  HTML-escaping can sextuple a string, so an escaped 63-character host is 378
+  bytes, and any buffer comfortable enough to hold a page around it is
+  uncomfortable on the server's stack. The compiler made the same point first:
+  `-Wformat-truncation`, which IDF builds as an error, refused the original.
+- **`form_field` decodes; `httpd_query_key_value` would not have.** IDF's
+  helper finds the key/value pair but hands the value back still
+  percent-encoded, so a password containing a space or an ampersand would have
+  been silently wrong. It also distinguishes missing from too-long, because
+  those need different messages and truncating a credential silently is how
+  this project already lost an afternoon.
+- **The reply page says "Nothing was saved" in bold.** A page that said
+  "Saved!" while discarding the values would be the most misleading screen in
+  the project: someone would reboot, find the old settings, and go hunting for
+  a bug in an NVS write that does not exist yet.
 
 ### Facts established on this branch (don't re-derive)
 
@@ -140,17 +206,82 @@ Three things it has to get right:
   wrong address. A router DHCP reservation remains the real fix.
 - **The button measures zero bounce** under effectively continuous polling.
   Debounce is set at 3 agreeing samples (60 ms) as insurance, not as a fix.
+- **`esp_http_server`'s default header budget is too small for a phone's
+  POST.** `CONFIG_HTTPD_MAX_REQ_HDR_LEN` is 512 bytes and covers the entire
+  header block of a request. The initial `GET` of the form fits inside it; the
+  `POST` that submits the form does not, once a mobile browser adds
+  `Content-Type`, `Content-Length`, `Origin`, `Referer` and the `sec-ch-*` set.
+  The server answers **431** and the handler never runs at all — so the failure
+  presents as the form being ignored, not as a size limit. It is a Kconfig
+  option rather than a field on `httpd_config_t`, so the fix lives in
+  `sdkconfig.defaults`, which walked straight into the `sdkconfig` trap above:
+  the existing `firmware/sdkconfig` had to be deleted before the new default
+  applied. Now 2048, which is one buffer per server instance (it lives in
+  `httpd_data`, not per connection) out of ~190 KB free heap.
+- **Opening or closing the serial port resets this board.** The XIAO ESP32-C3
+  is native USB-CDC, and the DTR/RTS toggle a host does on open and on close
+  reboots the chip. Consequence while testing: a capture that ends mid-session
+  restarts the gadget, and the fresh boot banner looks exactly like the chip
+  having rebooted on its own. It cost one wrongly-attributed reboot here — a
+  5-minute timeout appeared to have fired at 302 seconds — and was settled by
+  opening the port twice in a row and watching the second open produce a boot
+  banner. Any test spanning a timeout needs ONE capture across the whole
+  window, not two.
+- **A stable SSID plus a per-entry password means the phone cannot rejoin.**
+  The AP name is MAC-derived and therefore identical every session, so a phone
+  remembers the network and auto-reconnects with the *previous* session's
+  password about seven seconds after the hotspot appears — far too fast for
+  anyone to have typed anything. The AP logs
+  `station ... leave, reason = 15` (4-way handshake timeout) and the phone
+  reports the password as no longer valid and offers the field to retype it,
+  which is what makes this liveable rather than a dead end. Settled as
+  acceptable — see "The hotspot's name stays the same every time" below for
+  what the alternatives would have cost.
+- **The heartbeat's "not currently associated" was true and misleading.** In
+  setup mode there is no station by design, but a warning every ten seconds
+  reads as a fault during precisely the situation where someone is watching the
+  log for one. It now says `in setup mode (hotspot up); station radio is
+  stopped`.
+- **Browsers request `/favicon.ico` unprompted**, and a 404 for it logs two
+  warning lines per page load — the loudest thing in the log at the moment
+  someone is reading it to find out whether the form worked. A handler
+  returning 204 says "nothing here, and that is fine".
 - **`vTaskDelay` under one tick does not sleep.** At the default 100 Hz,
   `pdMS_TO_TICKS(5)` is 0, and `vTaskDelay(0)` yields instead of sleeping —
   which starves the idle task until the watchdog fires. Found in the
   standalone button test; `button.c` polls at 20 ms with a `_Static_assert`
   guarding it.
 
+### The hotspot's name stays the same every time — settled
+
+The AP name is MAC-derived (`TOKEN-MON-<last two MAC bytes>`) and therefore
+identical every session, while the password is new every entry. That
+combination means a phone which has joined before will try the old password
+first and fail.
+
+**Decided: leave it.** In practice the phone notices the rejected password,
+says so, and offers the field to type the new one — which is a prompt rather
+than a dead end, and it costs one extra tap in a flow that already involves
+reading a password off a screen. The alternatives both give something up: a
+per-entry SSID would leave a trail of one-off saved networks on the phone and
+lose the MAC suffix's identify-this-board property, and a fixed password would
+have to be either derived from the broadcast MAC (guessable by anyone in
+range) or written to NVS.
+
+The failure is worth recognising in a log, though, because it looks like
+nothing from the chip's side except `station ... leave, reason = 15`.
+
 ### Current chip state
 
-Flashed with the branch build. Config: SSID and password from `secrets.h`,
+Flashed with the stage-3 build. Config: SSID and password from `secrets.h`,
 host and port from NVS (`192.168.1.88:8734`). `pc_service` must be running on
 the PC or the screen says `NO LINK`, which is correct behaviour.
+
+**The address in NVS is currently wrong**, and knowingly so: the PC was on
+`192.168.1.87` during stage-3 testing while NVS still says `.88`, so the chip
+shows `NO LINK` even with `pc_service` running. Nothing here fixes that —
+stage 4 is what will, since a working save is exactly the ability to correct
+this from a phone. A router DHCP reservation remains the real fix.
 
 ## Stage 4 as built
 

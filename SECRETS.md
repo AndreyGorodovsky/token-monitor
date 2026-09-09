@@ -13,6 +13,7 @@ check before the repository goes public.
 | Claude OAuth token | `~/.claude/.credentials.json` (`%USERPROFILE%\.claude\.credentials.json` on Windows), outside this project entirely | No — `pc_service` reads it at runtime from that external path on every poll, never copies it in | N/A, nothing to gitignore |
 | WiFi SSID + password | `firmware/main/secrets.h`, **and/or** the chip's own NVS partition | Only the `secrets.h` half does | **gitignored** — only `secrets.h.example` (fake values) is committed. The NVS copy lives in flash on the chip and never touches the repo |
 | PC service's LAN host/port | `firmware/main/secrets.h` (same file — it's "this machine's network config", not just WiFi), **and/or** NVS | Only the `secrets.h` half does | **gitignored**, same as above |
+| Setup mode's hotspot password | Nowhere. Generated at random each time setup mode is entered, held in RAM, gone at the reboot that ends it | No | N/A — there is no file to ignore |
 
 Since these four values moved to runtime configuration, `secrets.h` is
 **optional**: NVS can supply all of them, and the firmware builds and runs
@@ -34,6 +35,16 @@ key. Two consequences worth stating plainly:
   hand-generating an NVS image with `nvs_partition_gen.py`. Revisit this
   sentence when the portal lands — it is the thing that makes the claim
   true.
+
+The hotspot password is the one credential this project deliberately
+**displays**. It is drawn on the panel in large type and printed to the serial
+log, and both are correct: it protects a network that exists for five minutes,
+whose only reachable service is the setup form, and it is shown to whoever is
+standing in front of the gadget. It is regenerated on every entry rather than
+derived from the MAC address, because the MAC is broadcast in every beacon
+frame and a derived password would therefore be computable by anyone in range.
+Nothing else in this project is ever printed: the WiFi password is logged as a
+character count, and the OAuth token never leaves the PC.
 
 Nothing else in this project should hold a real credential. If a future
 stage adds one (an API key, a different token, a password), add it to this

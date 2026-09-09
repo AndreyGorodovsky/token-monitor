@@ -33,3 +33,19 @@ CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 # link time later, once the firmware has grown into the space this was meant to
 # provide.
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Let a phone's request headers through to the setup form.
+#
+# esp_http_server buffers the whole header block of a request in one scratch
+# buffer, and IDF's default size for it is 512 bytes. That is enough for the
+# initial GET of the form and NOT enough for the POST that submits it: a
+# mobile browser adds Content-Type, Content-Length, Origin, Referer and the
+# sec-ch-* set on a form submission, which pushes the block past 512. The
+# server then answers 431 and the handler never runs at all -- so the failure
+# looks like the form being ignored rather than like a size limit.
+#
+# Found on hardware at provisioning stage 3: the GET was served, the POST was
+# refused. 2048 leaves comfortable margin over the ~900 bytes measured, and
+# costs one 2 KB buffer per server instance (it lives in httpd_data, not per
+# connection) out of ~190 KB free heap.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048

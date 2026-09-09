@@ -47,13 +47,52 @@ I (414) config:   host     "192.168.1.50"   (from nvs)
 
 `secrets.h` is therefore **optional** — the firmware builds and links without
 it. It is not yet possible to provision a chip that has no `secrets.h`,
-though, because the setup portal that would do it is still being built; until
-then the only alternative is a hand-generated NVS image
+though: the setup portal serves its form but does not write to NVS yet, so
+until that lands the only alternative is a hand-generated NVS image
 (`nvs_partition_gen.py`). The password is never logged, only its length.
 
-There is also a **setup button on D1** (see `../ARCHITECTURE.md`). A
-three-second hold is what counts; short taps are ignored deliberately. It
-currently draws a placeholder and is what will open the setup portal.
+## Setup mode (the button on D1)
+
+Hold the **setup button on D1** for three seconds (see `../ARCHITECTURE.md`
+for the wiring). Short taps are ignored deliberately — a desk object that
+reconfigures itself when brushed is a bad desk object.
+
+The chip then leaves your network and becomes its own hotspot. The screen
+shows everything needed to reach it:
+
+```
+        SETUP
+        WIFI
+   TOKEN-MON-F7CD          <- join this network
+        PASS
+      EDJW7QV4             <- with this password
+     192.168.4.1           <- then open this in a browser
+    HOLD TO EXIT
+        5 MIN              <- it ends by itself after this
+```
+
+The form comes up pre-filled with the current settings, with the WiFi password
+field blank — leave it blank to keep the one already stored. **This build does
+not save anything yet**: it parses the submission, reports it back, and says so
+in bold on the page. Writing the values is the next stage.
+
+To leave: hold the button for three seconds again, or do nothing for five
+minutes. Both reboot the chip. **Entering setup mode deletes nothing**, so an
+accidental press, a timeout, or pulling the power all leave the gadget exactly
+as it was.
+
+Two things worth knowing before you try it:
+
+- **The hotspot password is new every time**, while its name is not. A phone
+  that has joined before will try the old password first and be rejected; it
+  then tells you the password is no longer valid and offers the field to type
+  the new one, so this costs a tap rather than a detour. If your phone instead
+  just fails, tell it to forget the network and join again.
+- **The password is deliberately shown**, on screen and in the serial log. It
+  guards a network that exists for five minutes and serves nothing but this
+  form, and it is shown to whoever is standing in front of the gadget. Nothing
+  else in this project is ever printed — your WiFi password is logged as a
+  character count.
 
 ## Where this is in the build order
 
@@ -308,6 +347,9 @@ over the last known numbers, or a `NO DATA` screen if there are none yet.
 | Text mirrored, upside down, or rotated | Also `madctl`, but the scan-direction bits rather than colour: `0x40` MX flips horizontally, `0x80` MY vertically, `0x20` MV rotates 90°. Solid-colour tests cannot reveal this — only asymmetric content can |
 | Screen lit but streaky, noisy, or partial | Signal integrity — most likely the 40 MHz SPI clock over long jumper wires, or a loose SCL/SDA/DC line. `SPI_CLOCK_HZ` in `gc9a01.c` was 10 MHz through stage 7 and is the first thing to put back |
 | Build error naming `secrets.h` | You haven't copied `secrets.h.example` to `secrets.h` yet |
+| Phone will not join the setup hotspot | It is auto-reconnecting with the password from a previous session — the network name stays the same but the password does not. Most phones then say the password is wrong and let you type the new one; if yours does not, tell it to forget the network and join again. The chip's log shows the failure as `station ... leave, reason = 15` |
+| Setup form loads, but submitting it does nothing | Check the log for `431` / "request URI/header too long". `CONFIG_HTTPD_MAX_REQ_HDR_LEN` (in `sdkconfig.defaults`, raised to 2048) has to be large enough for a mobile browser's POST headers — the GET of the form fits in the 512-byte default and the POST does not |
+| The chip reboots whenever you close the serial monitor | Not a fault. This board is native USB-CDC, and the DTR/RTS toggle on opening *or* closing the port resets it. A test that spans a timeout needs one unbroken capture |
 | `disconnected (reason 201)` repeating | AP not found — wrong SSID, or the network is 5 GHz only |
 | `disconnected (reason 15)` or `(reason 2)` | Handshake failed — wrong password. A few `reason 2` retries *at startup* are normal and recover on their own |
 | `disconnected (reason 205)`, intermittent | Weak signal; check the antenna is attached to the XIAO |

@@ -31,6 +31,12 @@
  * BANNER_MAX_CHARS for that story, and the one above CONTENT_R for the rule
  * that keeps text and ring out of each other's way.
  *
+ * Since then, on the wifi-provisioning branch: a three-second press on the D1
+ * button turns the chip into its own hotspot serving a settings form, so
+ * changing networks no longer needs an editor and a USB cable. That mode lives
+ * in provision.c; what is here is the way in, the screen it draws, and the way
+ * out. Entering it deletes nothing, and every exit is a reboot.
+ *
  * Success looks like: a colour cycle, "CONNECTING", then both percentages with
  * their reset times, updating quietly every 45 seconds. pc_service must be
  * RUNNING on the PC this chip is configured to poll (see config.h) --
@@ -47,8 +53,9 @@
  *   6. the screen               -- palette, layout, staleness, rendering
  *   7. the gauge arcs           -- geometry, state, and drawing the delta
  *   8. the request and the loop -- stage 8: one fetch, then forever
- *   9. wifi_start()             -- one-time setup, in dependency order
- *  10. app_main()               -- the entry point; where execution begins
+ *   9. setup mode               -- provisioning stage 3: enter, and reboot out
+ *  10. wifi_start()             -- one-time setup, in dependency order
+ *  11. app_main()               -- the entry point; where execution begins
  *
  * One rule that is invisible in the code: gc9a01 is not thread-safe, and
  * drawing happens from two places -- app_main (the boot messages) and
@@ -107,6 +114,7 @@
 #include "config.h"                  /* the four runtime values: NVS first,
                                       * secrets.h as the fallback           */
 #include "button.h"                  /* the setup button on D1              */
+#include "provision.h"               /* stage 3: the setup hotspot + form   */
 
 /* Every log line we emit is prefixed with this, so our messages stay
  * greppable among the much noisier driver output ("wifi:", "esp_netif_
@@ -158,6 +166,22 @@ static int s_retry_count = 0;
  * aligned bool needs nothing stronger than that on this chip. */
 static volatile bool s_ever_connected = false;
 
+/* True from the moment setup mode is entered until the reboot that leaves it.
+ *
+ * It exists to switch off the reconnect machinery below, and it is the single
+ * thing most likely to be missed when reading this file. Becoming an access
+ * point means leaving station mode, and esp_wifi_stop() on an associated
+ * station emits WIFI_EVENT_STA_DISCONNECTED on its way out -- which the
+ * handler below treats, correctly in every other circumstance, as "the network
+ * dropped, ask again". Without this flag the retry timer spends the whole of
+ * setup mode dragging the radio back towards station mode while the hotspot is
+ * trying to run on it.
+ *
+ * Written on usage_task before the mode switch, read on the event loop and
+ * esp_timer tasks. Never cleared: every exit from setup mode is an
+ * esp_restart(), so the reboot is what clears it. */
+static volatile bool s_setup_mode = false;
+
 /* How long to wait before the next reconnect attempt.
  *
  * Fixed at 2 seconds through stage 7, which is right for the common case and
@@ -200,6 +224,14 @@ static esp_timer_handle_t s_reconnect_timer;
  * pointer supplied at creation time -- we don't need one, so it goes unused. */
 static void reconnect_timer_cb(void *arg)
 {
+    /* A timer armed just before setup mode began can still fire once after the
+     * radio has left station mode. Reconnecting then is not merely pointless,
+     * it is the thing setup mode exists to prevent. */
+    if (s_setup_mode) {
+        ESP_LOGI(TAG, "reconnect timer fired in setup mode -- ignoring");
+        return;
+    }
+
     esp_err_t err = esp_wifi_connect();
     if (err == ESP_OK) {
         return;                  /* the outcome arrives later, as an event */
@@ -220,6 +252,15 @@ static void reconnect_timer_cb(void *arg)
      * off like every other retry. */
     ESP_LOGW(TAG, "esp_wifi_connect() failed: %s -- retrying anyway",
              esp_err_to_name(err));
+
+    /* Checked a second time, deliberately. The flag can have been set while
+     * esp_wifi_connect was running -- which is in fact the likeliest way this
+     * branch is reached during a mode switch -- and re-arming here would
+     * quietly restore the retry loop this function just declined to run. */
+    if (s_setup_mode) {
+        return;
+    }
+
     s_retry_count++;
 
     esp_timer_stop(s_reconnect_timer);
@@ -280,6 +321,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         /* Clear the flag first: nothing waiting on it should go on believing
          * we are connected while we retry. */
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
+
+        /* In setup mode this event is not a fault, it is us: leaving station
+         * mode to raise the hotspot is what produced it. Retrying would fight
+         * the mode switch. See s_setup_mode. */
+        if (s_setup_mode) {
+            ESP_LOGI(TAG, "station stopped for setup mode (reason %d), not retrying",
+                     e->reason);
+            return;
+        }
 
         /* The reason code is the single most useful number when this stage
          * fails. Common ones: 201 = AP not found (wrong SSID, or the network
@@ -708,6 +758,44 @@ static void print_usage(const usage_t *u)
 #define ARC_R_IN       112
 #define CONTENT_R      (ARC_R_IN - 2)
 
+/* The setup screen (stage 3), which shares nothing with the layout above
+ * because it is answering a different question: not "how am I doing" at a
+ * glance from across the room, but "what do I type into my phone" from about
+ * thirty centimetres away.
+ *
+ * Six lines is a lot for this panel, so each was checked against the circle
+ * rather than eyeballed. The usable half-width at row y is
+ * sqrt(CONTENT_R^2 - (y-120)^2), and the tight row of a line is whichever of
+ * its top and bottom edges is further from the centre. At SCALE_LABEL that
+ * allows 17 characters at the SSID row, 16 at the URL, 13 at the hint and 8 at
+ * the countdown -- against actual contents of 14, 11, 12 and 5. The countdown
+ * is the one with the least slack, which is why it counts in whole minutes:
+ * "5 MIN" fits where "4 MIN 30 SEC" could not.
+ *
+ *              . - - - - - - - - .
+ *   26  |            S E T U P          |   <- scale 3
+ *   66  |             W I F I           |   <- dim label
+ *   84  |   T O K E N - M O N - A 3 F 2 |
+ *  108  |             P A S S           |
+ *  126  |        K 7 Q M X 4 R D        |
+ *  156  |      1 9 2 . 1 6 8 . 4 . 1    |
+ *  182  |     H O L D   T O   E X I T   |
+ *  204  |            5   M I N          |
+ *              ' - - - - - - - - '
+ *
+ * No arcs are drawn in setup mode -- there is no reading to gauge -- but the
+ * text still respects CONTENT_R, because the rule about staying off the rim is
+ * enforced in one place (draw_centred) and this screen has no reason to be the
+ * exception. */
+#define ROW_SET_TITLE   26
+#define ROW_SET_L1      66
+#define ROW_SET_SSID    84
+#define ROW_SET_L2     108
+#define ROW_SET_PASS   126
+#define ROW_SET_URL    156
+#define ROW_SET_HINT   182
+#define ROW_SET_MINS   204
+
 #define SCALE_LABEL  2       /* 12x14 px per character */
 #define SCALE_VALUE  5       /* 30x35 -- the number you read from across a desk */
 
@@ -922,6 +1010,7 @@ typedef enum {
     SCREEN_NOTHING,    /* nothing drawn yet: the first draw must be a full one */
     SCREEN_MESSAGE,    /* words only: CONNECTING, NO LINK, ...                 */
     SCREEN_USAGE,      /* the real layout: labels, numbers, reset times        */
+    SCREEN_SETUP,      /* stage 3: the hotspot's name, password and url        */
 } screen_mode_t;
 
 typedef enum {
@@ -1220,6 +1309,76 @@ static void render_message(const char *line1, const char *line2)
     forget_drawn();
 }
 
+/* --- stage 3: the setup screen -------------------------------------------
+ *
+ * Everything a person needs in order to reach the form, and nothing else. The
+ * three values are useless separately -- a network name you cannot join, a
+ * password for a network you cannot find, an address on a network you are not
+ * on -- so they are drawn together, once, in one full repaint.
+ *
+ * This is also the only screen in the project that displays a credential on
+ * purpose. It is a credential to a network that exists for five minutes, whose
+ * only reachable service is this form, and it is shown to whoever is standing
+ * in front of the gadget -- which is a different thing entirely from the WiFi
+ * password or the OAuth token, neither of which ever appears here. */
+static void render_setup(const provision_info_t *info)
+{
+    gc9a01_fill_screen(COL_BG);
+
+    /* The slot model above describes the usage screen, and the fill just
+     * erased whatever it believed was on the glass. Saying so is what stops
+     * the next usage repaint from diffing against a screen that no longer
+     * exists -- though in practice nothing here ever gets that far, because
+     * every exit from setup mode is a reboot. */
+    forget_drawn();
+
+    draw_centred(ROW_SET_TITLE, "SETUP", COL_TIME, 3);
+
+    /* Green for the two things you have to copy by hand, dimmer for the
+     * labels that only say what they are, and the URL in the same colour as a
+     * reset time -- something to read, not something to retype. There is no
+     * deduping here of the kind render_message does: this screen is drawn
+     * exactly once per entry, and the values are new each time anyway. */
+    draw_centred(ROW_SET_L1,   "WIFI",          COL_LABEL, SCALE_LABEL);
+    draw_centred(ROW_SET_SSID, info->ssid,      COL_OK,    SCALE_LABEL);
+    draw_centred(ROW_SET_L2,   "PASS",          COL_LABEL, SCALE_LABEL);
+    draw_centred(ROW_SET_PASS, info->password,  COL_OK,    SCALE_LABEL);
+    draw_centred(ROW_SET_URL,  info->url,       COL_TIME,  SCALE_LABEL);
+
+    /* How to leave, on the screen rather than only in the documentation. The
+     * same button, the same three seconds -- one gesture to learn, and the
+     * only one this gadget has. */
+    draw_centred(ROW_SET_HINT, "HOLD TO EXIT", COL_LABEL, SCALE_LABEL);
+
+    s_mode = SCREEN_SETUP;
+}
+
+/* The countdown to the automatic exit, in whole minutes, rounded up.
+ *
+ * Worth the row it costs: setup mode ends by itself, and a screen that gave no
+ * sign of that would make the reboot look like a crash to anyone who walked
+ * away mid-form. Rounded up so the last sixty seconds read "1 MIN" rather than
+ * "0 MIN", which would look like it had already expired.
+ *
+ * Called once a second by the loop below but drawing only when the number
+ * changes -- the same "repaint nothing unless it differs" rule the usage
+ * screen follows, and for the same reason: a line that repaints on a timer is
+ * a line that flickers. */
+static void render_setup_minutes(int minutes)
+{
+    static int drawn = -1;
+    char       buf[12];
+
+    if (minutes == drawn) {
+        return;
+    }
+    drawn = minutes;
+
+    snprintf(buf, sizeof(buf), "%d MIN", minutes);
+    clear_band(ROW_SET_MINS, GC9A01_CHAR_H * SCALE_LABEL);
+    draw_centred(ROW_SET_MINS, buf, COL_LABEL, SCALE_LABEL);
+}
+
 /* The actual point of the whole project: usage_t, on the glass.
  *
  * `reason` is NULL when this reading is the one just fetched, or a short word
@@ -1484,6 +1643,112 @@ static void fetch_once(char *storage, int storage_cap)
     esp_http_client_cleanup(client);
 }
 
+/* --- stage 3: setup mode -------------------------------------------------- */
+
+/* How long the hotspot stays up with nobody finishing the form.
+ *
+ * Five minutes is long enough to find your phone, join a network and type an
+ * address, and short enough that a press nobody follows up on -- a knock, a
+ * cat, a curious visitor -- puts the gadget back to work by itself. It is not
+ * a security boundary; it is the answer to "what happens if I walk away".
+ *
+ * Nothing is lost when it expires. Setup mode deletes nothing on the way in
+ * (the single most important property of this design), so a timeout returns
+ * exactly the configuration the chip had before the button was pressed. */
+#define SETUP_TIMEOUT_MS   (5 * 60 * 1000)
+
+/* How often the countdown wakes to redraw itself. It is also how quickly the
+ * exit press is noticed, since the same wait serves both. */
+#define SETUP_TICK_MS      1000
+
+/* Enter setup mode, and never come back.
+ *
+ * Both ways out -- the second long press and the timeout -- fall through to
+ * the same esp_restart() at the bottom. That is deliberate and worth
+ * protecting: two exits with two implementations would be two chances to leave
+ * the radio half-switched, and the failure would show up only in whichever one
+ * is exercised less. A reboot is also the simplest possible way to put a chip
+ * that has been an access point back to being a station, with no partially
+ * torn-down state to reason about, and it is what stage 4 will need anyway to
+ * apply newly saved settings.
+ *
+ * Runs on usage_task, which is what makes the drawing calls in here legal: the
+ * panel belongs to that task and nothing else may touch it. */
+static void enter_setup_mode(void)
+{
+    ESP_LOGI(TAG, "entering setup mode");
+
+    /* Suppression FIRST, before anything can produce the disconnect event that
+     * it exists to swallow. See s_setup_mode. The timer is stopped in the same
+     * breath: one may already be armed and about to fire. */
+    s_setup_mode = true;
+    esp_timer_stop(s_reconnect_timer);
+    xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
+
+    /* Raising an AP takes a moment, and the button was released three seconds
+     * ago. Something has to acknowledge the press before then, or the gadget
+     * looks like it ignored it. */
+    render_message("SETUP", "STARTING");
+
+    provision_info_t info;
+    esp_err_t err = provision_start(&s_cfg, &info);
+    if (err != ESP_OK) {
+        /* The radio is now in an unknown state -- somewhere between a station
+         * and an access point -- and there is no honest way to carry on from
+         * here. Reboot back into normal operation, which still has the old
+         * config, because nothing was deleted. */
+        ESP_LOGE(TAG, "setup mode failed to start: %s", esp_err_to_name(err));
+        render_message("SETUP", "FAILED");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+    }
+
+    render_setup(&info);
+
+    const int64_t deadline_us =
+        esp_timer_get_time() + (int64_t)SETUP_TIMEOUT_MS * 1000;
+    const char *why = "timed out";
+
+    while (1) {
+        int64_t left_us = deadline_us - esp_timer_get_time();
+        if (left_us <= 0) {
+            break;
+        }
+
+        /* Rounded UP to whole minutes: the final sixty seconds should read
+         * "1 MIN", not "0 MIN", which would look like it had already expired.
+         * The + 59999999 is that rounding-up done in integer arithmetic --
+         * there are 60000000 microseconds in a minute, and adding one less
+         * than that before dividing carries any remainder up to the next
+         * whole minute. */
+        render_setup_minutes((int)((left_us + 59999999) / 60000000));
+
+        /* The same bit, and the same three-second hold, that got us in here.
+         * pdTRUE clears it on the way out -- unlike the main loop, which
+         * clears it by hand after deciding what to do; here there is nothing
+         * left to decide. */
+        EventBits_t bits = xEventGroupWaitBits(s_events, BUTTON_SETUP_BIT,
+                                               pdTRUE, pdFALSE,
+                                               pdMS_TO_TICKS(SETUP_TICK_MS));
+        if (bits & BUTTON_SETUP_BIT) {
+            why = "second long press";
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "leaving setup mode (%s) -- restarting", why);
+    render_message("RESTARTING", NULL);
+
+    /* Long enough to read, and long enough that a finger still on the button
+     * from the exit press has usually let go before the chip boots. It is only
+     * cosmetic if it has not: button.c treats a pin that is already low at
+     * startup as a press that is already spent, so a held button cannot
+     * re-trigger setup mode -- it just prints a wiring warning that, in this
+     * one case, is a false alarm. */
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
 /* --- stage 8: the refresh loop -------------------------------------------- */
 
 /* The task that owns the display for the rest of the program's life.
@@ -1533,20 +1798,16 @@ static void usage_task(void *arg)
          * because the button task must not draw: the panel belongs to this
          * task alone once app_main has handed it over.
          *
-         * Stage 2 has nothing to enter yet, so it acknowledges and carries on.
-         * The acknowledgement is not decoration -- it is what proves the whole
-         * chain (pin, debounce, event bit, task wake, display) works, and it
-         * is the thing stage 4 replaces with the actual setup screen. */
+         * Stage 3 makes this the entry to setup mode, which never returns:
+         * every way out of it is a reboot. So there is no falling through to
+         * the normal path from here, and nothing below this point runs again
+         * until the chip has restarted. */
         if (xEventGroupGetBits(s_events) & BUTTON_SETUP_BIT) {
+            /* Cleared before entering rather than after, so that the press
+             * that opened setup mode cannot be mistaken for the press that
+             * closes it -- which would slam the door on the way in. */
             xEventGroupClearBits(s_events, BUTTON_SETUP_BIT);
-            ESP_LOGI(TAG, "setup requested -- no setup mode to enter yet (stage 2)");
-            render_message("BUTTON", "HELD 3S");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            /* render_message called forget_drawn(), so whatever is drawn next
-             * repaints in full rather than diffing against a screen that is no
-             * longer there. Falling through to the normal path from here is
-             * deliberate: it puts the real numbers back immediately instead of
-             * leaving this message up until the next refresh. */
+            enter_setup_mode();          /* does not return */
         }
 
         /* Nothing usable to connect to or poll. This has to be checked HERE,
@@ -1903,6 +2164,16 @@ void app_main(void)
      * task has nothing else to do, and no other handler is waiting on it. */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
+
+        /* In setup mode there is no station to report on, by design -- the
+         * radio is an access point. Without this the heartbeat prints a
+         * warning every ten seconds throughout, which reads as a fault
+         * during the one situation where someone is most likely to be
+         * watching the serial log for one. */
+        if (s_setup_mode) {
+            ESP_LOGI(TAG, "in setup mode (hotspot up); station radio is stopped");
+            continue;
+        }
 
         /* Ask the driver about the AP we are associated with. A failure
          * return is itself the useful signal -- it means we are not currently

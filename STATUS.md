@@ -65,7 +65,7 @@ Five stages. **1 through 4 are done and verified on hardware; 5 is next.**
 | review pass — six findings, all real | **done** (`5c800ef`) |
 | 3 — SoftAP + HTML form, submissions logged but NOT saved | **done** — verified end to end on hardware |
 | 4 — save to NVS, reboot to apply, empty config enters setup | **done** — all three verified on hardware, including a chip with nothing at all |
-| 5 — polish: verify-before-commit, SSID scan dropdown, captive portal | **next** |
+| 5 — polish: network list, open-network box, captive portal, recovery | **built**; the portal does not raise a pop-up on the phone tested |
 
 ### Decisions already made — don't re-litigate these
 
@@ -366,6 +366,89 @@ Four things proved at once, which is what made the erase worth it:
 `secrets.h` was restored and the chip reflashed afterwards, so the tree and the
 board match again. The chip is still running entirely on values typed into a
 phone -- NVS wins per key, and there is nothing in `secrets.h` it needs.
+
+### Stage 5 as built
+
+Four items, one of which turned into a different item once the hardware had an
+opinion.
+
+**Verify-before-commit was dropped, and replaced.** Checking credentials means
+associating, and a soft-AP is forced onto its station's channel -- the
+`csa_count` field in `wifi_ap_config_t` exists precisely to announce that
+switch to connected clients. So the check would move the hotspot out from
+under the phone waiting to be told the result. What the person actually needs
+is that a typo cannot strand the gadget, and that is achievable from the other
+side: a configuration that has never connected now brings the chip back into
+setup mode by itself.
+
+Two thresholds, because the two failures are not equally certain, and getting
+this wrong would have broken a promise the project already keeps:
+
+- **Five consecutive authentication failures** (reasons 15, 202, 204) -- a
+  rejected handshake says the password is wrong and says it confidently.
+- **Ten minutes of never connecting at all**, for `NO_AP_FOUND` (201). That is
+  what a wrong SSID looks like, and *equally* what a router still booting after
+  a power cut looks like. Acting on it quickly would send the gadget into setup
+  mode every time the power flickered -- the exact unattended recovery stage 8
+  was built to provide. Ten minutes is far beyond a reboot and far short of a
+  working day.
+
+Both apply only to a boot that never reached an IP. A link that worked and
+dropped is an outage, and outages are retried forever, as before.
+
+**The network list is buttons, not a `<datalist>`.** The datalist is the
+textbook answer and was wrong here for a reason worth recording: browsers
+*filter* datalist options against whatever the field already contains, and the
+field is pre-filled with the current SSID -- so the only surviving suggestion
+was the value already in the box. On hardware it presented as "the dropdown
+does not open, it only shows my current wifi name", which is the filter working
+exactly as specified and being useless. Buttons that fill the field in do not
+depend on any of that, and are visible without a tap.
+
+The SSID travels in a `data-` attribute rather than in generated JavaScript.
+That is a security decision: building a line of script around a name taken off
+the air puts an attacker-chosen string where escaping mistakes are executable.
+
+**The scan runs before the AP is raised**, while the chip is still a station
+and there is nothing to disturb -- a scan hops channels, and a soft-AP that
+hops with it stops answering the phone attached to it. It costs about 2.5
+seconds, absorbed by the SETUP / STARTING screen, and deduplicates names: 3
+access points in range offered 2 networks, which is one mesh or repeater seen
+twice.
+
+**The open-network checkbox** closes the gap stage 4 could only document. The
+password field now has three meanings rather than two -- typed, blank (keep the
+stored one), and blank with the box ticked (the network is open; store an empty
+password, which is a value rather than an absence). Ticking the box *and*
+typing a password is refused rather than guessed at.
+
+### The captive portal works, and does not pop up
+
+Everything the firmware controls was verified on hardware:
+
+```
+captive_dns: answered 1 queries (latest type 1 from 192.168.4.2)
+provision: redirecting /generate_204 to the form
+provision: serving the form
+```
+
+The phone queries our DNS, gets the gadget's address for every name, its
+Android connectivity probe lands on our server, and the 302 goes back. The
+form is then fetched. **No pop-up and no notification appeared on the phone
+tested**, and the page still had to be opened by hand.
+
+That is left as it is, deliberately. The device-side chain is provably correct
+at every step it owns, and what happens after the 302 is the phone's decision
+-- Android's captive-portal handling varies by version and vendor, and some
+builds simply do not surface it. The responder costs nothing when it does not
+fire, may well work on another phone or an iPhone, and the screen still shows
+the URL, which is how setup mode worked for two stages before any of this
+existed.
+
+The diagnostic line in `captive_dns` is the part worth keeping either way: it
+separates "the portal did not pop up" from "the portal was never consulted",
+two failures that look identical from the outside and have completely
+different fixes. Without it this section would have been a guess.
 
 ### A blank password with a changed SSID is refused
 

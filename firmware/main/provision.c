@@ -12,15 +12,17 @@
  * ---------------------------------------------------------------------------
  * HOW THIS FILE IS ORGANIZED, top to bottom:
  *
- *   1. module state          -- the three file-scope variables, and why they
- *                               need no lock
+ *   1. module state          -- the file-scope variables, and why they need
+ *                               no lock
  *   2. the hotspot's identity -- a recognisable name, and a random password
  *                               that the display's font can actually draw
- *   3. the form              -- the HTML, the escaping, and why the pages are
+ *   3. the networks in range  -- the scan behind the ssid suggestions, and the
+ *                               one moment it is safe to run
+ *   4. the form               -- the HTML, the escaping, and why the pages are
  *                               streamed rather than built in a buffer
- *   4. reading the submission -- url-decoding, validation, the write to NVS,
+ *   5. reading the submission -- url-decoding, validation, the write to NVS,
  *                               and the reply that says what happened
- *   5. provision_start()     -- the swap itself, in dependency order
+ *   6. provision_start()      -- the swap itself, in dependency order
  * ---------------------------------------------------------------------------
  *
  * WHICH TASK IS RUNNING WHAT. provision_start() runs on usage_task, the
@@ -31,12 +33,22 @@
  * being served.
  *
  * What is deliberately absent: any check that the submitted credentials
- * actually work before keeping them (verify-before-commit is stage 5), any DNS
- * responder (decided against for v1 -- this gadget has a screen and can simply
- * tell you the URL), and any call into gc9a01. The panel belongs to
- * usage_task; this module reports, and lets the caller draw. That includes the
- * restart after a save: this file writes the values and sets a flag, and the
- * caller decides when to reboot.
+ * actually work before keeping them, and any call into gc9a01.
+ *
+ * The first was considered at stage 5 and rejected on a hardware constraint
+ * rather than on effort. Testing credentials means associating, and a soft-AP
+ * is forced onto its station's channel -- so the check would move the hotspot
+ * out from under the phone that is waiting to be told the result. The gadget
+ * recovers instead: a config that cannot connect brings the chip back here by
+ * itself. See enter_setup_mode in token_monitor.c.
+ *
+ * The second is the standing rule. The panel belongs to usage_task; this
+ * module reports, and lets the caller draw. That includes the restart after a
+ * save: this file writes the values and sets a flag, and the caller decides
+ * when to reboot.
+ *
+ * The captive-portal DNS responder lives next door in captive_dns.c, started
+ * and stopped from here.
  */
 
 #include <string.h>                  /* memcpy, strlen, strncmp, strchr      */
@@ -45,6 +57,7 @@
 
 #include "esp_wifi.h"                /* the radio driver: mode, config, start */
 #include "esp_netif.h"               /* the AP interface and its DHCP server  */
+#include "dhcpserver/dhcpserver.h"   /* OFFER_DNS -- see announce_dns_server  */
 #include "esp_event.h"               /* to hear about devices joining the AP  */
 #include "esp_mac.h"                 /* esp_read_mac -- the AP's own MAC      */
 #include "esp_random.h"              /* the hardware RNG behind the password  */
@@ -53,6 +66,7 @@
                                       * the stage-0 partition bump paid for  */
 #include "esp_log.h"                 /* ESP_LOGI / ESP_LOGW / ESP_LOGE       */
 
+#include "captive_dns.h"            /* the portal's other half: the DNS lie */
 #include "provision.h"
 
 static const char *TAG = "provision";
@@ -93,6 +107,11 @@ static struct {
  * what the current configuration is. Two answers to that question is exactly
  * the sort of thing that drifts. */
 static volatile bool s_saved;
+
+/* The AP's own address as text, e.g. "192.168.4.1". Filled in once the netif
+ * exists, and used by the redirect below to build an absolute URL. Kept as a
+ * string because that is the only form it is ever needed in. */
+static char s_portal_ip[PROV_URL_CAP];
 
 bool provision_saved(void)
 {
@@ -181,7 +200,109 @@ static void make_ssid(char *out, size_t cap)
     snprintf(out, cap, "TOKEN-MON-%02X%02X", mac[4], mac[5]);
 }
 
-/* --- 3. the form ---------------------------------------------------------- */
+/* --- 3. the networks in range --------------------------------------------
+ *
+ * Typing an SSID from memory is the single likeliest way to get setup wrong:
+ * they are case-sensitive, often contain a digit somebody guesses at, and the
+ * failure arrives minutes later as a reason-201 loop with nothing on screen to
+ * say which character was wrong. Offering the list removes the guess.
+ *
+ * WHEN this happens is the whole design. A scan hops across every channel, and
+ * a soft-AP that hops with it stops answering the phone attached to it -- so
+ * scanning with the hotspot already up would break the very page the list is
+ * for. It therefore runs at entry, while the chip is still a station and
+ * before the AP exists, when there is nothing to disturb. The cost is a couple
+ * of seconds added to setup-mode entry, which the SETUP / STARTING screen
+ * already covers.
+ *
+ * A failed scan is not a failure of setup mode. The list is a convenience, and
+ * the field is a text input with suggestions rather than a dropdown, so a
+ * hidden network -- which by definition never appears in a scan -- can still
+ * be typed in full. */
+
+/* Enough to cover a dense flat; beyond this the list stops being a help. Each
+ * entry costs CFG_SSID_CAP bytes of .bss, so 12 is about 400 bytes. */
+#define SCAN_MAX_SHOWN  12
+
+static char   s_scan[SCAN_MAX_SHOWN][CFG_SSID_CAP];
+static size_t s_scan_count;
+
+/* True if `ssid` is already in the list.
+ *
+ * Duplicates are the norm rather than the exception: a mesh or a repeater puts
+ * the same name on several radios, and each is a separate scan result. Showing
+ * one name three times would make the list look broken. */
+static bool scan_already_listed(const char *ssid)
+{
+    for (size_t i = 0; i < s_scan_count; i++) {
+        if (strcmp(s_scan[i], ssid) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void scan_for_networks(void)
+{
+    s_scan_count = 0;
+
+    /* Blocking, so the results are ready before the AP goes up and there is no
+     * second thing in flight during the mode switch. `true` is the block
+     * argument; the default config scans every channel actively. */
+    esp_err_t err = esp_wifi_scan_start(NULL, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed (%s) -- the ssid field will just be empty",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    uint16_t found = 0;
+    if (esp_wifi_scan_get_ap_num(&found) != ESP_OK || found == 0) {
+        ESP_LOGW(TAG, "scan found nothing");
+        return;
+    }
+
+    /* The driver holds the results until they are fetched, and fetching frees
+     * them. Ask for at most what we can show: esp_wifi_scan_get_ap_records
+     * takes the buffer size as an in/out count and clears the rest itself, so
+     * asking for fewer than were found is fine and is not a leak.
+     *
+     * Records are returned strongest-first, which is why there is no sorting
+     * here -- the nearest networks, the ones most likely to be yours, are
+     * already at the top. */
+    uint16_t          wanted = SCAN_MAX_SHOWN;
+    wifi_ap_record_t *recs   = calloc(wanted, sizeof(wifi_ap_record_t));
+    if (recs == NULL) {
+        /* The driver's copy has to be released either way. esp_wifi.h is
+         * explicit that the results stay allocated until they are fetched or
+         * cleared, so returning here without this would leak them for the rest
+         * of setup mode -- which is short, but this is also the low-memory
+         * path, i.e. exactly when that matters. */
+        ESP_LOGW(TAG, "no memory for scan results -- skipping the list");
+        esp_wifi_clear_ap_list();
+        return;
+    }
+
+    if (esp_wifi_scan_get_ap_records(&wanted, recs) == ESP_OK) {
+        for (uint16_t i = 0; i < wanted && s_scan_count < SCAN_MAX_SHOWN; i++) {
+            const char *ssid = (const char *)recs[i].ssid;
+
+            /* A hidden network broadcasts an empty SSID. There is nothing to
+             * offer, and an empty entry in the list would look like a bug. */
+            if (ssid[0] == '\0' || scan_already_listed(ssid)) {
+                continue;
+            }
+            snprintf(s_scan[s_scan_count], CFG_SSID_CAP, "%s", ssid);
+            s_scan_count++;
+        }
+    }
+    free(recs);
+
+    ESP_LOGI(TAG, "scan: %u networks in range, offering %u",
+             (unsigned)found, (unsigned)s_scan_count);
+}
+
+/* --- 4. the form ---------------------------------------------------------- */
 
 /* Everything is inline: no external stylesheet, no web font, no favicon. A
  * phone joined to this AP has no route to the internet, so every reference to
@@ -210,6 +331,21 @@ static const char PAGE_HEAD[] =
     "button{width:100%;padding:13px;font-size:16px;font-weight:600;border:0;"
     "border-radius:8px;background:#2dc85f;color:#0b0d12}"
     "small{color:#767c8c}"
+    /* The checkbox row is the one label that is NOT a stacked block: the box
+     * and its text belong on one line, and the shared `span{display:block}`
+     * rule above would otherwise push the words underneath the box. */
+    /* No negative top margin here. It was -8px first, to tighten the gap
+     * under the input, and on a phone that pulled the caption up against the
+     * field above it -- the two read as one crowded block. The label already
+     * carries the spacing; this only needs to sit clear of the input. */
+    ".nets{margin:12px 0 0}"
+    ".nets small{display:block;margin-bottom:2px}"
+    ".chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}"
+    ".net{width:auto;padding:8px 12px;font-size:14px;font-weight:400;"
+    "background:#1e222b;color:#cfd4e0;border:1px solid #333a48}"
+    ".check{display:flex;align-items:center;gap:10px}"
+    ".check span{display:inline;margin:0;font-size:15px;color:#e6e8ef}"
+    ".check input{width:auto;flex:none}"
     ".bad{background:#3a1f22;border:1px solid #7a3038;padding:12px;"
     "border-radius:8px;margin-bottom:20px}"
     ".note{background:#1e222b;border:1px solid #333a48;padding:12px;"
@@ -335,18 +471,66 @@ static esp_err_t form_get(httpd_req_t *req)
     html_escape(s_form.ssid, esc, sizeof(esc));
     send_value(req, esc);
 
+    /* This stays a plain text field, so a hidden network -- which by
+     * definition never appears in a scan -- can still be typed in full. */
     httpd_resp_sendstr_chunk(req,
         "\" maxlength=\"32\" required autocapitalize=\"off\" "
-        "autocorrect=\"off\" spellcheck=\"false\"></label>");
+        "autocorrect=\"off\" spellcheck=\"false\">");
+
+    /* The networks in range, as buttons that fill the field in.
+     *
+     * This was a <datalist> first, which is the textbook answer and was wrong
+     * here for a reason worth writing down: browsers FILTER datalist options
+     * against whatever the field already contains. The field is pre-filled
+     * with the current SSID, so the only surviving suggestion was the value
+     * already in the box -- the list appeared to do nothing at all, which is
+     * exactly how it was reported on hardware. A pre-filled field and a
+     * datalist do not work together.
+     *
+     * Buttons do not depend on any of that. They also survive the mobile
+     * browsers whose datalist support is decorative, and they make the list
+     * visible without a tap, which is what someone standing in front of an
+     * unfamiliar form actually wants.
+     *
+     * The SSID goes into a data- attribute rather than into generated
+     * JavaScript, and that is a security decision, not a style one: building a
+     * line of JS around a name taken off the air would put an attacker-chosen
+     * string inside a script, where escaping mistakes are executable. In an
+     * attribute it is inert text, and html_escape already handles quotes. */
+    if (s_scan_count > 0) {
+        httpd_resp_sendstr_chunk(req,
+            "<div class=\"nets\"><small>Networks in range &mdash; tap to "
+            "use:</small><div class=\"chips\">");
+
+        for (size_t i = 0; i < s_scan_count; i++) {
+            html_escape(s_scan[i], esc, sizeof(esc));
+            httpd_resp_sendstr_chunk(req,
+                "<button type=\"button\" class=\"net\" data-ssid=\"");
+            send_value(req, esc);
+            httpd_resp_sendstr_chunk(req, "\">");
+            send_value(req, esc);
+            httpd_resp_sendstr_chunk(req, "</button>");
+        }
+        httpd_resp_sendstr_chunk(req, "</div></div>");
+    }
+    httpd_resp_sendstr_chunk(req, "</label>");
 
     /* The password field is ALWAYS empty. The stored one is not in this
      * module's memory to render even by accident -- see s_form. */
+    /* The checkbox resolves an ambiguity a text field cannot: a blank password
+     * means "keep the one already stored", and there was previously no way to
+     * say "this network genuinely has none". Without it a configured chip
+     * could never be moved to an open network -- the gap stage 4 found and
+     * could only document. */
     httpd_resp_sendstr_chunk(req,
         "<label><span>WiFi password</span>"
         "<input name=\"pass\" type=\"password\" maxlength=\"64\" "
         "placeholder=\"leave blank to keep current\" "
         "autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\">"
         "<small>Leave blank to keep the current password.</small></label>"
+        "<label class=\"check\">"
+        "<input name=\"open\" type=\"checkbox\" value=\"1\">"
+        "<span>This network has no password</span></label>"
         "<label><span>PC address</span>"
         "<input name=\"host\" value=\"");
 
@@ -366,8 +550,24 @@ static esp_err_t form_get(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req,
         "\"></label>"
         "<button type=\"submit\">Save</button></form>"
-        "<p><small>This build does not save yet &mdash; it reports what it "
-        "received, so the form can be checked on its own.</small></p>");
+        "<p><small>Saving restarts the gadget so it can use the new "
+        "settings.</small></p>");
+
+    /* One listener per button, reading the name back out of the attribute.
+     * Nothing here is generated from a network name, so there is no string to
+     * escape into JavaScript and no way for a hostile SSID to become code.
+     *
+     * If scripting is off or fails, the buttons simply do nothing and the
+     * field is still typeable -- the form does not depend on this working. */
+    if (s_scan_count > 0) {
+        httpd_resp_sendstr_chunk(req,
+            "<script>"
+            "document.querySelectorAll('.net').forEach(function(b){"
+            "b.addEventListener('click',function(){"
+            "document.getElementsByName('ssid')[0].value=b.dataset.ssid;});"
+            "});"
+            "</script>");
+    }
     httpd_resp_sendstr_chunk(req, PAGE_TAIL);
 
     /* A zero-length chunk is what terminates a chunked response. Without it
@@ -388,7 +588,48 @@ static esp_err_t favicon_get(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* --- 4. reading the submission -------------------------------------------- */
+/* Anything we do not recognise gets sent to the form.
+ *
+ * This is the HTTP half of the captive portal, and the DNS half is useless
+ * without it. A phone that joins a network immediately fetches a known URL to
+ * test whether the internet is really there -- Android asks for
+ * /generate_204 and expects an empty 204, Apple asks for /hotspot-detect.html
+ * and expects a page containing the word "Success". captive_dns has already
+ * pointed those names at this device, so the request lands here.
+ *
+ * Answering 404 would be the honest thing and the wrong thing: the phone would
+ * conclude the network is broken rather than that it needs attention, and
+ * would show a "no internet" warning instead of opening anything. A 302 is
+ * what it is looking for -- the universal sign of "you are behind a portal" --
+ * and opening the target is what phones do next, which is the entire trick.
+ *
+ * Registered as a wildcard so it also catches the dozen other probe URLs
+ * various vendors use, plus anyone who simply mistypes the address.
+ */
+static esp_err_t redirect_get(httpd_req_t *req)
+{
+    /* An absolute URL, because a relative one would be resolved against the
+     * hostname the phone asked for -- connectivitycheck.gstatic.com -- and
+     * send it straight back here in a loop. */
+    char location[PROV_URL_CAP + 8];
+    snprintf(location, sizeof(location), "http://%s/", s_portal_ip);
+
+    ESP_LOGI(TAG, "redirecting %s to the form", req->uri);
+
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+
+    /* Some clients follow the header and some render the body; a line of HTML
+     * costs nothing and covers the ones that do neither. */
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req,
+        "<!doctype html><meta charset=\"utf-8\">"
+        "<p>Setting up the token monitor &mdash; "
+        "<a href=\"/\">open the form</a>.</p>");
+    return ESP_OK;
+}
+
+/* --- 5. reading the submission -------------------------------------------- */
 
 /* A form POST arrives as application/x-www-form-urlencoded: key=value pairs
  * joined by '&', spaces as '+', and anything else interesting as %XX.
@@ -591,6 +832,13 @@ static esp_err_t save_post(httpd_req_t *req)
         return send_problem(req, field_problem(rc, "The port"));
     }
 
+    /* An unchecked checkbox is not submitted at all -- that is how HTML forms
+     * work, and it is why this one field is allowed to be missing where the
+     * other four are not. Present with any value means ticked. */
+    char open_str[8];
+    const bool open_network = (form_field(body, "open", open_str,
+                                          sizeof(open_str)) == 0);
+
     /* Note which field is NOT checked for emptiness: the password. Blank is a
      * meaningful answer there -- "keep the one already stored" -- and it is
      * also what an open network legitimately has. config_is_complete makes the
@@ -600,6 +848,16 @@ static esp_err_t save_post(httpd_req_t *req)
     }
     if (host[0] == '\0') {
         return send_problem(req, "The PC address cannot be empty.");
+    }
+
+    /* "This network has no password" and a typed password contradict each
+     * other, and guessing which was meant is the wrong move with a credential.
+     * Ask instead. */
+    if (open_network && pass[0] != '\0') {
+        return send_problem(req,
+            "You ticked \"this network has no password\" but also typed one. "
+            "Untick the box to use the password you typed, or clear the "
+            "password field to use an open network.");
     }
 
     /* Changing the network while leaving the password blank.
@@ -629,8 +887,8 @@ static esp_err_t save_post(httpd_req_t *req)
      * "this network has no password" checkbox, which belongs with stage 5's
      * polish. Home networks that are genuinely open are rare enough, and
      * inadvisable enough, that this is not worth a field of its own today. */
-    if (pass[0] == '\0' && s_form.ssid[0] != '\0' &&
-        strcmp(ssid, s_form.ssid) != 0) {
+    if (!open_network && pass[0] == '\0' &&
+        s_form.ssid[0] != '\0' && strcmp(ssid, s_form.ssid) != 0) {
         return send_problem(req,
             "You changed the WiFi network, so its password is needed too. "
             "Leaving the password blank keeps the one already stored, which "
@@ -649,11 +907,23 @@ static esp_err_t save_post(httpd_req_t *req)
     /* The password's LENGTH, never the password itself. Same rule as config.c:
      * a value one character short is a real failure worth being able to see,
      * and the length makes it visible while giving away nothing worth having. */
-    const bool keep_password = (pass[0] == '\0');
+    /* Three meanings for the password field now, not two, which is what the
+     * checkbox bought:
+     *
+     *   typed              -> use it
+     *   blank              -> keep whatever is stored
+     *   blank + box ticked -> the network is open; store an empty password,
+     *                         which is a value rather than an absence
+     *
+     * Only the last two look alike on the wire, and only the box tells them
+     * apart. Before it existed, a configured chip could not be moved to an
+     * open network at all -- the gap stage 4 found and could only write down. */
+    const bool keep_password = (pass[0] == '\0' && !open_network);
 
     ESP_LOGI(TAG, "form submitted:");
     ESP_LOGI(TAG, "  ssid     \"%s\"", ssid);
     ESP_LOGI(TAG, "  password %u chars%s", (unsigned)strlen(pass),
+             open_network  ? " (open network -- storing an empty password)" :
              keep_password ? " (blank -- keeping the current one)" : "");
     ESP_LOGI(TAG, "  host     \"%s\"", host);
     ESP_LOGI(TAG, "  port     %ld", port);
@@ -708,7 +978,9 @@ static esp_err_t save_post(httpd_req_t *req)
     send_value(req, esc);
 
     httpd_resp_sendstr_chunk(req, "</b><br>WiFi password: <b>");
-    if (keep_password) {
+    if (open_network) {
+        httpd_resp_sendstr_chunk(req, "none &mdash; open network</b>");
+    } else if (keep_password) {
         httpd_resp_sendstr_chunk(req, "unchanged</b>");
     } else {
         snprintf(num, sizeof(num), "%u characters", (unsigned)strlen(pass));
@@ -739,7 +1011,7 @@ static esp_err_t save_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* --- 5. provision_start: the swap itself ------------------------------------------------ */
+/* --- 6. provision_start: the swap itself --------------------------------- */
 
 /* Logged so the serial monitor shows a phone arriving. Without it, "I joined
  * the network but the page will not load" and "I never actually joined" look
@@ -760,6 +1032,7 @@ static void on_ap_event(void *arg, esp_event_base_t base, int32_t id, void *data
  * provision_start use this: the normal way out of setup mode is a reboot. */
 static void stop_all(void)
 {
+    captive_dns_stop();
     if (s_server != NULL) {
         httpd_stop(s_server);
         s_server = NULL;
@@ -798,6 +1071,12 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
         ESP_LOGI(TAG, "not associated at entry (%s) -- fine, continuing",
                  esp_err_to_name(err));
     }
+
+    /* The one safe moment to look around: disconnected, still a station, and
+     * with no hotspot yet for a channel-hopping scan to knock over. Two lines
+     * later the radio is an AP and this would be a mistake. See the section
+     * above for why that ordering is not negotiable. */
+    scan_for_networks();
     err = esp_wifi_stop();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_stop: %s", esp_err_to_name(err));
@@ -903,6 +1182,50 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
         snprintf(out->url, sizeof(out->url), "192.168.4.1");
         ESP_LOGW(TAG, "could not read the ap address -- showing the default");
     }
+    snprintf(s_portal_ip, sizeof(s_portal_ip), "%s", out->url);
+
+    /* Tell joining devices to use us as their DNS server.
+     *
+     * esp_netif.h says the DHCP server's main DNS defaults to the server's own
+     * address, which is what we want -- but whether that option is *offered*
+     * in the DHCP reply at all is a separate flag, and a client that is never
+     * offered one falls back to whatever it already had. On a phone that means
+     * a hardcoded public resolver, which this hotspot cannot reach, so the
+     * portal probe would resolve to nothing and the pop-up would never come.
+     *
+     * The stop/start around it is required rather than tidy: esp_netif.h is
+     * explicit that the DHCP server has to be stopped for new DNS information
+     * to reach clients. Setting it on a running server changes nothing and
+     * reports success, which is the worst combination to debug.
+     *
+     * None of this is load-bearing for the form itself. If every line here
+     * fails, the address is still on the screen and still typeable -- which is
+     * how setup mode worked for two stages before the portal existed. */
+    esp_netif_dhcps_stop(s_ap_netif);
+
+    esp_netif_dns_info_t dns = { 0 };
+    dns.ip.type            = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = ip.ip.addr;
+    if (esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns) != ESP_OK) {
+        ESP_LOGW(TAG, "could not set the dns server offered to clients");
+    }
+
+    uint8_t offer = OFFER_DNS;
+    if (esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                               ESP_NETIF_DOMAIN_NAME_SERVER,
+                               &offer, sizeof(offer)) != ESP_OK) {
+        ESP_LOGW(TAG, "could not enable the dhcp dns option");
+    }
+
+    esp_err_t dhcp_err = esp_netif_dhcps_start(s_ap_netif);
+    if (dhcp_err != ESP_OK) {
+        /* This one IS load-bearing: without a DHCP server a phone gets no
+         * address and cannot reach anything, screen or no screen. */
+        ESP_LOGE(TAG, "could not restart the dhcp server: %s",
+                 esp_err_to_name(dhcp_err));
+        stop_all();
+        return dhcp_err;
+    }
 
     httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
 
@@ -914,6 +1237,13 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
     hcfg.stack_size       = 6144;
     hcfg.lru_purge_enable = true;   /* a phone that leaves sockets open must
                                      * not be able to lock everyone else out */
+
+    /* Without this the wildcard route below is matched literally -- as a
+     * request for a path whose name is a star -- and never fires. The default
+     * matcher compares whole strings; this one understands the wildcard, and
+     * it is the difference between a working captive portal and a silent
+     * one. */
+    hcfg.uri_match_fn = httpd_uri_match_wildcard;
 
     err = httpd_start(&s_server, &hcfg);
     if (err != ESP_OK) {
@@ -938,9 +1268,18 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
     static const httpd_uri_t icon_uri = {
         .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get,
     };
+    /* The wildcard MUST be registered last. esp_http_server walks its table in
+     * registration order and takes the first match, so a wildcard sitting
+     * ahead of the root route would swallow the form itself and redirect it
+     * to itself -- a loop that looks like the portal working right up until
+     * the page never arrives. */
+    static const httpd_uri_t any_uri = {
+        .uri = "/*", .method = HTTP_GET, .handler = redirect_get,
+    };
     err = httpd_register_uri_handler(s_server, &form_uri);
     if (err == ESP_OK) { err = httpd_register_uri_handler(s_server, &save_uri); }
     if (err == ESP_OK) { err = httpd_register_uri_handler(s_server, &icon_uri); }
+    if (err == ESP_OK) { err = httpd_register_uri_handler(s_server, &any_uri); }
     if (err != ESP_OK) {
         /* A running server with no routes would answer 404 to everything,
          * which looks like a working hotspot serving a broken gadget. Better
@@ -949,6 +1288,14 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
                  esp_err_to_name(err));
         stop_all();
         return err;
+    }
+
+    /* The portal, last and optional. A failure here costs the pop-up and
+     * nothing else -- the address is on the screen, which is how this worked
+     * before the responder existed -- so it is logged rather than unwound. */
+    if (captive_dns_start(ip.ip.addr) != ESP_OK) {
+        ESP_LOGW(TAG, "no captive portal this time; the form is still at %s",
+                 out->url);
     }
 
     ESP_LOGI(TAG, "setup mode: join \"%s\", then open http://%s",

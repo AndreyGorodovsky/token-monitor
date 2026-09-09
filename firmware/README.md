@@ -72,6 +72,13 @@ shows everything needed to reach it:
         5 MIN              <- it ends by itself after this
 ```
 
+On joining, the gadget tries to make the form open by itself — it runs a DNS
+responder that points every name at its own address, so a phone's
+"is there internet here?" check lands on the setup page instead. Whether that
+produces a pop-up is up to the phone: **it did not on the Android device this
+was built against**, which is why the address is on the screen and why this
+section still tells you to type it. Nothing is lost when it does not fire.
+
 The form comes up pre-filled with the current settings, with the WiFi password
 field blank — leave it blank to keep the one already stored. Submitting it
 saves the values and restarts the chip to use them; the page says so, and the
@@ -90,9 +97,21 @@ deletes nothing**, so an accidental press, a timeout, or pulling the power all
 leave the gadget exactly as it was — the settings change only when a form is
 actually submitted.
 
+The networks in range are offered as buttons under the WiFi field; tapping one
+fills it in. Hidden networks never appear in a scan, so the field stays a text
+box you can type into.
+
 A chip with no usable configuration — no `secrets.h`, nothing in NVS — enters
 setup mode on its own at boot and stays there, with no five-minute timeout,
 because there is nothing for it to time out back to.
+
+**A configuration that cannot connect also comes back here by itself**, so a
+mistyped password cannot strand the gadget: five rejected handshakes, or ten
+minutes without ever reaching the network, and the chip re-enters setup mode
+with `BAD PASSWORD` or `NO NETWORK` on the panel. The ten minutes is
+deliberate slack — "no such network" is also what a router looks like while it
+is still booting after a power cut, and the gadget is supposed to survive that
+unattended.
 
 Two things worth knowing before you try it:
 

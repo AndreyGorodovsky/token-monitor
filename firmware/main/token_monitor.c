@@ -182,6 +182,40 @@ static volatile bool s_ever_connected = false;
  * esp_restart(), so the reboot is what clears it. */
 static volatile bool s_setup_mode = false;
 
+/* Consecutive disconnects on this boot whose reason code says "your
+ * credentials are wrong" rather than "your network is not here".
+ *
+ * Stage 5 uses this to take an unusable configuration back into setup mode by
+ * itself, so that a typo cannot strand the gadget. What it must NOT do is
+ * break the promise stage 8 made -- that a chip left alone survives the router
+ * rebooting overnight -- and the two are easy to confuse, because both present
+ * as "not connected". The reason code is what separates them, so it is the
+ * reason code this counts.
+ *
+ * Reset by a success, and only ever read on usage_task. */
+static volatile int s_auth_failures = 0;
+
+/* True when the reason we were disconnected points at the password rather than
+ * at the world.
+ *
+ * Deliberately NOT included, and each omission is the interesting part:
+ *
+ *   - WIFI_REASON_NO_AP_FOUND (201). The commonest wrong-SSID symptom, and
+ *     also exactly what a router that is powered off looks like. Treating it
+ *     as a credential fault would send a chip into setup mode every time the
+ *     power flickered, which is precisely the unattended recovery this project
+ *     already has working. It gets the slow path below instead.
+ *   - WIFI_REASON_AUTH_EXPIRE (2). STATUS.md records this as routine at boot
+ *     on this WPA3 network, recovering on its own. Counting it would send a
+ *     perfectly healthy chip into setup mode on a normal morning.
+ */
+static bool reason_is_credentials(int reason)
+{
+    return reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||   /* 15  */
+           reason == WIFI_REASON_AUTH_FAIL ||                /* 202 */
+           reason == WIFI_REASON_HANDSHAKE_TIMEOUT;          /* 204 */
+}
+
 /* How long to wait before the next reconnect attempt.
  *
  * Fixed at 2 seconds through stage 7, which is right for the common case and
@@ -349,6 +383,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * was added to stop, reappearing silently from a config change in a
          * different file. */
         s_retry_count++;
+
+        /* Only while this boot has never worked. A link that was up and went
+         * away is an outage, however it failed, and outages are retried
+         * forever -- see the note above s_auth_failures. */
+        if (!s_ever_connected && reason_is_credentials(e->reason)) {
+            s_auth_failures++;
+        }
+
         ESP_LOGW(TAG, "disconnected (reason %d), retry %d", e->reason, s_retry_count);
 
         /* Hand the wait to esp_timer and return immediately, so this handler
@@ -377,8 +419,10 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
 
-    s_retry_count = 0;               /* a success resets the retry tally,
+    s_retry_count   = 0;             /* a success resets the retry tally,
                                       * and with it the backoff spacing     */
+    s_auth_failures = 0;             /* ...and clears any suspicion of the
+                                      * credentials, which plainly work     */
     s_ever_connected = true;
 
     /* IPSTR and IP2STR are a matched pair of ESP-IDF macros for printing an
@@ -1661,6 +1705,32 @@ static void fetch_once(char *storage, int storage_cap)
  * exit press is noticed, since the same wait serves both. */
 #define SETUP_TICK_MS      1000
 
+/* When a configuration that cannot connect should give up and ask to be fixed.
+ *
+ * Stage 5's replacement for verify-before-commit. Checking credentials at save
+ * time means associating, and a soft-AP is dragged onto its station's channel
+ * -- so the check would knock the phone off the very page waiting to be told
+ * the result. Recovering afterwards achieves the same thing for the person
+ * holding the phone (a typo cannot strand the gadget) with none of that.
+ *
+ * Two thresholds, because the two failures are not equally certain:
+ *
+ *   - A handshake that is rejected says the password is wrong, and says it
+ *     with confidence. Five of those in a row is not a bad night; it is a bad
+ *     password. Acting quickly is safe.
+ *   - "No AP found" is ambiguous. It is what a wrong SSID looks like, and
+ *     equally what a router that is still booting after a power cut looks
+ *     like. Acting on it quickly would break the promise that this gadget
+ *     survives the router rebooting overnight, so it waits out anything a
+ *     router could plausibly be doing. Ten minutes is far beyond a reboot and
+ *     far short of a working day.
+ *
+ * Both apply only to a boot that has NEVER connected. A link that worked and
+ * dropped is an outage, and outages are retried forever.
+ */
+#define RECOVER_AUTH_FAILURES   5
+#define RECOVER_SILENT_MS       (10 * 60 * 1000)
+
 /* Enter setup mode, and never come back.
  *
  * Both ways out -- the second long press and the timeout -- fall through to
@@ -1903,6 +1973,39 @@ static void usage_task(void *arg)
                 show_failure("NO WIFI", "NO WIFI", "RECONNECTING");
             } else {
                 render_message("CONNECTING", NULL);
+            }
+
+            /* A configuration that has never worked, failing in a way that
+             * says why. Rather than sit on CONNECTING forever -- which is what
+             * every version before stage 5 did, and which tells you nothing
+             * and offers you nothing -- the chip goes and asks to be fixed.
+             *
+             * Note both conditions require !s_ever_connected: this can only
+             * fire on a boot that never got as far as an IP. That is the line
+             * between "these settings are wrong" and "the network is having a
+             * bad day", and it is the whole reason this is safe to do
+             * automatically. */
+            if (!s_ever_connected) {
+                const int64_t up_ms = esp_timer_get_time() / 1000;
+
+                if (s_auth_failures >= RECOVER_AUTH_FAILURES) {
+                    ESP_LOGW(TAG, "%d authentication failures and never "
+                                  "connected -- the password looks wrong; "
+                                  "entering setup mode", s_auth_failures);
+                    render_message("BAD PASSWORD", "SETUP...");
+                    vTaskDelay(pdMS_TO_TICKS(2500));
+                    enter_setup_mode();          /* does not return */
+                }
+
+                if (up_ms > RECOVER_SILENT_MS) {
+                    ESP_LOGW(TAG, "no connection in %d minutes from a cold "
+                                  "boot -- the network name may be wrong, or "
+                                  "the network may be gone; entering setup mode",
+                             (int)(RECOVER_SILENT_MS / 60000));
+                    render_message("NO NETWORK", "SETUP...");
+                    vTaskDelay(pdMS_TO_TICKS(2500));
+                    enter_setup_mode();          /* does not return */
+                }
             }
 
             /* Block until the radio is back, or until the refresh interval is

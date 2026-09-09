@@ -177,10 +177,17 @@ void config_load(app_config_t *out)
     /* NVS_READONLY even now that config_save exists, and for a better reason
      * than "this function does not write": opening a namespace read-only that
      * has never been created returns ESP_ERR_NVS_NOT_FOUND rather than
-     * creating it. A chip that has only ever been flashed therefore reads its
-     * defaults without leaving an empty namespace behind, and the "no 'cfg'
-     * namespace in nvs yet" line below stays truthful until something has
-     * actually been saved. */
+     * creating it, so reading a chip's defaults does not leave an empty
+     * namespace behind.
+     *
+     * Do NOT read the "no 'cfg' namespace yet" line below as proof that
+     * nothing was ever provisioned, though -- it stopped meaning that when
+     * config_mark_proven arrived. That function opens the same namespace
+     * read-write, so the first time a secrets.h-only chip connects, the
+     * namespace comes into existence with nothing in it but the proven
+     * fingerprint, and this line never appears again. The per-key "(from
+     * secrets.h)" lines further down are the diagnostic to trust: they are
+     * more specific, and they stay true. */
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
     if (err == ESP_OK) {
@@ -328,6 +335,10 @@ bool config_is_proven(const app_config_t *cfg)
 
 esp_err_t config_mark_proven(const app_config_t *cfg)
 {
+    /* READWRITE creates the namespace if it is not there, which on a
+     * secrets.h-only chip it will not be. That is intended -- there is nowhere
+     * else to put this -- but it does mean the namespace can exist without any
+     * configuration having been saved. config_load's comment says so. */
     nvs_handle_t h;
     esp_err_t    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) {

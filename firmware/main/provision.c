@@ -283,7 +283,17 @@ static void scan_for_networks(void)
         return;
     }
 
-    if (esp_wifi_scan_get_ap_records(&wanted, recs) == ESP_OK) {
+    esp_err_t fetch = esp_wifi_scan_get_ap_records(&wanted, recs);
+    if (fetch != ESP_OK) {
+        /* Same reasoning as the calloc failure above: the driver holds those
+         * records until they are fetched or cleared, and a fetch that FAILED
+         * has not fetched them. Leaving them costs memory for the whole of
+         * setup mode, immediately before the AP netif, the HTTP server and the
+         * DHCP server all want allocations of their own. */
+        ESP_LOGW(TAG, "could not read the scan results (%s)",
+                 esp_err_to_name(fetch));
+        esp_wifi_clear_ap_list();
+    } else {
         for (uint16_t i = 0; i < wanted && s_scan_count < SCAN_MAX_SHOWN; i++) {
             const char *ssid = (const char *)recs[i].ssid;
 
@@ -1176,12 +1186,26 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
      * the screen as an instruction -- so it is the one place it must not be
      * guessed. */
     esp_netif_ip_info_t ip = { 0 };
-    if (esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
-        snprintf(out->url, sizeof(out->url), IPSTR, IP2STR(&ip.ip));
-    } else {
-        snprintf(out->url, sizeof(out->url), "192.168.4.1");
-        ESP_LOGW(TAG, "could not read the ap address -- showing the default");
+    if (esp_netif_get_ip_info(s_ap_netif, &ip) != ESP_OK || ip.ip.addr == 0) {
+        /* Fall back to what IDF's default AP netif uses -- but fix the NUMBER
+         * as well as the string.
+         *
+         * An earlier version set only out->url here, which reads as harmless
+         * and is not: `ip` stays all-zero, and it is `ip.ip.addr` that the
+         * DHCP server hands out as the client's DNS server and that the
+         * responder answers every query with. A phone joining would have been
+         * told its resolver was 0.0.0.0 and had every name resolve to 0.0.0.0
+         * -- so nothing would load at all, which is considerably worse than
+         * the "no portal, type the address off the screen" degradation this
+         * whole block promises. The screen would meanwhile have been showing a
+         * perfectly correct address.
+         *
+         * One assignment keeps the three consumers agreeing with each other,
+         * which is the only property that matters here. */
+        ip.ip.addr = ESP_IP4TOADDR(192, 168, 4, 1);
+        ESP_LOGW(TAG, "could not read the ap address -- assuming the default");
     }
+    snprintf(out->url, sizeof(out->url), IPSTR, IP2STR(&ip.ip));
     snprintf(s_portal_ip, sizeof(s_portal_ip), "%s", out->url);
 
     /* Tell joining devices to use us as their DNS server.

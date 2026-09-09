@@ -1782,9 +1782,31 @@ static void enter_setup_mode(void)
          * and an access point -- and there is no honest way to carry on from
          * here. Reboot back into normal operation, which still has the old
          * config, because nothing was deleted. */
+        /* How long to wait before rebooting depends on what there is to go
+         * back to, and getting this wrong makes a bad situation worse.
+         *
+         * With a working config, a reboot returns the gadget to showing usage
+         * numbers, so it should happen promptly -- three seconds is enough to
+         * read the screen.
+         *
+         * With NO usable config there is nothing to return to: the next boot
+         * finds the same empty config, comes straight back here, and fails the
+         * same way. That is a restart every few seconds for as long as
+         * whatever broke stays broken -- most likely memory, since raising the
+         * AP allocates a netif, a DHCP server and the HTTP server's buffers.
+         * Thrashing does not help and hides the message. Waiting half a minute
+         * keeps it a slow retry that can still recover on its own, with the
+         * failure legible on the panel in between.
+         *
+         * A reboot rather than staying put either way: the radio is in an
+         * unknown state between station and access point, and there is no
+         * honest way to carry on from that. */
+        const bool nowhere_to_return_to = !config_is_complete(&s_cfg);
+
         ESP_LOGE(TAG, "setup mode failed to start: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "restarting in %d s", nowhere_to_return_to ? 30 : 3);
         render_message("SETUP", "FAILED");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(nowhere_to_return_to ? 30000 : 3000));
         esp_restart();
     }
 
@@ -1962,9 +1984,20 @@ static void usage_task(void *arg)
              * who never edits secrets.h at all: power it on, and it comes up
              * as a hotspot asking for the four values.
              *
-             * No timeout applies in there -- see enter_setup_mode -- so this
-             * cannot become a reboot loop. And it never returns, so nothing
-             * below runs until the chip has restarted with a configuration. */
+             * Setup mode applies no timeout to a chip in this state (see
+             * enter_setup_mode), so it waits here indefinitely rather than
+             * rebooting every five minutes at someone.
+             *
+             * That covers the timeout, and deliberately not the other exit: if
+             * setup mode cannot START -- no memory for the AP, the server, the
+             * DHCP server -- it does restart, and the next boot arrives back
+             * here to try the same thing. That is a retry loop by design,
+             * since there is no other way out, but it is paced at half a
+             * minute rather than spinning. See the failure branch of
+             * enter_setup_mode.
+             *
+             * It never returns, so nothing below runs until the chip has
+             * restarted with a configuration. */
             ESP_LOGW(TAG, "config incomplete -- ssid, host and port must all "
                           "be set; entering setup mode to ask for them");
             enter_setup_mode();          /* does not return */

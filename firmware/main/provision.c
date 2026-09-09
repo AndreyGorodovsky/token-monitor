@@ -254,6 +254,35 @@ static void html_escape(const char *in, char *out, size_t cap)
  * with -Wformat-truncation, which IDF builds as an error. Chunks have no
  * buffer to overflow: each piece is sent as it is produced, and the response
  * is complete when the zero-length chunk goes out. */
+/* Send one variable-length piece of a page -- and do nothing at all if it is
+ * empty.
+ *
+ * That guard is the whole reason this function exists, and it is not defensive
+ * padding. httpd_resp_sendstr_chunk with an empty string calls
+ * httpd_resp_send_chunk(req, "", 0), which writes the chunk header `0\r\n`
+ * followed by `\r\n` -- and a zero-length chunk is precisely how HTTP/1.1
+ * signals THE END OF THE BODY. The browser stops parsing there and discards
+ * everything sent afterwards.
+ *
+ * Which turns an empty value into a truncated page, silently. A chip with no
+ * secrets.h and nothing in NVS has an empty SSID, so the form would end
+ * mid-attribute at `<input name="ssid" value="` -- no password field, no host,
+ * no port, no Save button. That is not an edge case: it is an unprovisioned
+ * chip, i.e. exactly the situation this whole feature exists to rescue, and
+ * the one stage 4 intends to enter automatically.
+ *
+ * Skipping the call is correct rather than merely safe: a chunked body is the
+ * concatenation of its chunks, so contributing nothing and contributing an
+ * empty string mean the same thing to the page. Only the API disagrees.
+ *
+ * Not to be used for the terminating call, which passes NULL deliberately. */
+static void send_value(httpd_req_t *req, const char *s)
+{
+    if (s[0] != '\0') {
+        httpd_resp_sendstr_chunk(req, s);
+    }
+}
+
 /* `req` is the request: esp_http_server hands one to every handler, and it is
  * both the thing you read the request from and the thing you write the reply
  * to. Returning ESP_OK means "answered"; returning an error makes the server
@@ -282,7 +311,7 @@ static esp_err_t form_get(httpd_req_t *req)
         "<input name=\"ssid\" value=\"");
 
     html_escape(s_form.ssid, esc, sizeof(esc));
-    httpd_resp_sendstr_chunk(req, esc);
+    send_value(req, esc);
 
     httpd_resp_sendstr_chunk(req,
         "\" maxlength=\"32\" required autocapitalize=\"off\" "
@@ -300,7 +329,7 @@ static esp_err_t form_get(httpd_req_t *req)
         "<input name=\"host\" value=\"");
 
     html_escape(s_form.host, esc, sizeof(esc));
-    httpd_resp_sendstr_chunk(req, esc);
+    send_value(req, esc);
 
     httpd_resp_sendstr_chunk(req,
         "\" maxlength=\"63\" required autocapitalize=\"off\" "
@@ -310,7 +339,7 @@ static esp_err_t form_get(httpd_req_t *req)
         "value=\"");
 
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)s_form.port);
-    httpd_resp_sendstr_chunk(req, port_str);
+    send_value(req, port_str);
 
     httpd_resp_sendstr_chunk(req,
         "\"></label>"
@@ -479,17 +508,47 @@ static esp_err_t save_post(httpd_req_t *req)
      * and will nearly always arrive in one piece, and "nearly always" is how
      * this class of bug hides until the day someone has a long password. */
     int received = 0;
+    int timeouts = 0;
+
     while (received < req->content_len) {
         int r = httpd_req_recv(req, body + received, req->content_len - received);
 
         if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-            continue;                    /* the client is merely slow */
+            /* A timeout means the client is slow, and retrying is right --
+             * but only for a while. `continue` on its own is an unbounded
+             * wait, and the client that triggers it is one that announced a
+             * Content-Length and then vanished without closing the socket: a
+             * phone whose screen locked, or that walked out of range
+             * mid-submit. There is no FIN to end the loop, so it would retry
+             * for as long as the socket lives.
+             *
+             * That matters more here than it would in most servers, because
+             * esp_http_server runs one handler at a time on one task. A
+             * handler that never returns is a server that never answers
+             * anything again -- the form stops loading, the gadget looks
+             * dead, and nothing recovers it before the five-minute timeout
+             * reboots the chip. Giving up after a few tries costs a lost
+             * submission, which the person can simply make again.
+             *
+             * The counter resets on progress, so a genuinely slow client is
+             * not penalised for the time it has already spent. At the default
+             * 5-second recv_wait_timeout this is a ceiling of about 15
+             * seconds without a single byte arriving. */
+            if (++timeouts > 3) {
+                ESP_LOGW(TAG, "gave up waiting for the form body after %d of "
+                              "%d bytes -- the client stopped sending",
+                         received, req->content_len);
+                return ESP_FAIL;
+            }
+            continue;
         }
         if (r <= 0) {
             ESP_LOGW(TAG, "receiving the form body failed (%d)", r);
             return ESP_FAIL;             /* socket gone; nowhere to send a page */
         }
+
         received += r;
+        timeouts  = 0;
     }
     body[received] = '\0';
 
@@ -557,11 +616,11 @@ static esp_err_t save_post(httpd_req_t *req)
         "<p>WiFi network: <b>");
 
     html_escape(ssid, esc, sizeof(esc));
-    httpd_resp_sendstr_chunk(req, esc);
+    send_value(req, esc);
 
     httpd_resp_sendstr_chunk(req, "</b><br>WiFi password: <b>");
     snprintf(num, sizeof(num), "%u characters", (unsigned)strlen(pass));
-    httpd_resp_sendstr_chunk(req, num);
+    send_value(req, num);
     httpd_resp_sendstr_chunk(req, "</b>");
     if (pass[0] == '\0') {
         httpd_resp_sendstr_chunk(req, " (blank &mdash; would keep the current one)");
@@ -569,11 +628,11 @@ static esp_err_t save_post(httpd_req_t *req)
 
     httpd_resp_sendstr_chunk(req, "<br>PC address: <b>");
     html_escape(host, esc, sizeof(esc));
-    httpd_resp_sendstr_chunk(req, esc);
+    send_value(req, esc);
 
     httpd_resp_sendstr_chunk(req, "</b><br>Port: <b>");
     snprintf(num, sizeof(num), "%ld", port);
-    httpd_resp_sendstr_chunk(req, num);
+    send_value(req, num);
 
     httpd_resp_sendstr_chunk(req,
         "</b></p><p><a href=\"/\">Back to the form</a></p>");
@@ -659,10 +718,28 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
         }
     }
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, &on_ap_event, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, &on_ap_event, NULL, NULL));
+    /* Not ESP_ERROR_CHECK, here or below.
+     *
+     * ESP_ERROR_CHECK aborts -- a panic dump over serial and a reboot, with
+     * nothing on the screen to say why. provision.h promises the opposite:
+     * that a failure is undone and returned, so enter_setup_mode can draw
+     * SETUP / FAILED for three seconds before restarting deliberately. These
+     * calls allocate (the netif, its DHCP server, and the server's own
+     * buffers), so they are exactly the ones that fail when memory is short,
+     * and a "degrade visibly, not silently" project should not answer that
+     * with a stack trace. */
+    err = esp_event_handler_instance_register(
+        WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, &on_ap_event, NULL, NULL);
+    if (err == ESP_OK) {
+        err = esp_event_handler_instance_register(
+            WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, &on_ap_event, NULL, NULL);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not register the ap event handlers: %s",
+                 esp_err_to_name(err));
+        stop_all();
+        return err;
+    }
 
     /* The = { 0 } matters for the same reason it does in wifi_start: it leaves
      * every field we do not set at its default, and the credential arrays
@@ -682,6 +759,31 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
      * password shown on the screen costs one more thing to type and closes
      * that off. provision.h has the reasoning for generating it per entry. */
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+
+    /* Keep this password out of flash.
+     *
+     * esp_wifi defaults to WIFI_STORAGE_FLASH ("The default value is
+     * WIFI_STORAGE_FLASH", esp_wifi.h), which means esp_wifi_set_config does
+     * not merely configure the radio -- it writes the SSID and the password
+     * into the driver's own unencrypted `nvs.net80211` namespace, where they
+     * outlive the reboot that ends setup mode and are readable by anyone who
+     * can dump the flash over USB.
+     *
+     * That would quietly falsify what SECRETS.md says about this credential
+     * ("Nowhere ... held in RAM, gone at the reboot that ends it"), and a
+     * secrets inventory that is wrong is worse than one that is missing. It
+     * would also spend a flash write on a value with a five-minute life.
+     *
+     * RAM storage is not restored afterwards, deliberately: every exit from
+     * setup mode is a reboot, and wifi_start() applies the station config
+     * again from scratch on the next boot. */
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not switch wifi config storage to RAM: %s",
+                 esp_err_to_name(err));
+        stop_all();
+        return err;
+    }
 
     err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err == ESP_OK) { err = esp_wifi_set_config(WIFI_IF_AP, &ap); }
@@ -738,9 +840,18 @@ esp_err_t provision_start(const app_config_t *current, provision_info_t *out)
     static const httpd_uri_t icon_uri = {
         .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get,
     };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &form_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &save_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &icon_uri));
+    err = httpd_register_uri_handler(s_server, &form_uri);
+    if (err == ESP_OK) { err = httpd_register_uri_handler(s_server, &save_uri); }
+    if (err == ESP_OK) { err = httpd_register_uri_handler(s_server, &icon_uri); }
+    if (err != ESP_OK) {
+        /* A running server with no routes would answer 404 to everything,
+         * which looks like a working hotspot serving a broken gadget. Better
+         * to fail the whole entry and say so on the panel. */
+        ESP_LOGE(TAG, "could not register the uri handlers: %s",
+                 esp_err_to_name(err));
+        stop_all();
+        return err;
+    }
 
     ESP_LOGI(TAG, "setup mode: join \"%s\", then open http://%s",
              out->ssid, out->url);

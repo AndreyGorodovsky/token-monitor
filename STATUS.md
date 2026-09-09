@@ -158,6 +158,22 @@ after the timeout printed the original four settings back unchanged. That last
 detail is the one worth keeping: five minutes in setup mode cost the chip
 nothing, which is what makes an accidental press harmless.
 
+That run tested the code as first written. A review afterwards found four real
+faults (see the commit "Fix four review findings in the setup hotspot"), and
+the corrected build was re-flashed and exercised twice more: the button
+entered and left setup mode cleanly on both presses. What those two presses
+did NOT re-exercise is the form itself -- and the honest reading of that is
+that one of the four fixes remains unproven on hardware rather than proven.
+
+The gap is narrow, though, and worth stating precisely rather than waving at.
+`send_value()` skips the send only when the string is empty; for a non-empty
+value it is the same call as before, byte for byte, so a chip with a config
+renders exactly the page that was already verified. The case the fix exists
+for -- an empty pre-fill on an unprovisioned chip -- cannot be reached at all
+without erasing this chip's config first, which is a thing to do deliberately
+at stage 4, when an empty config is supposed to enter setup mode on its own
+and the erase is part of the test rather than a detour.
+
 Decisions worth not re-litigating:
 
 - **The AP password comes from a 26-character alphabet, not the printable

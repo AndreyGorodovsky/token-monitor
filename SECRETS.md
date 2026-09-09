@@ -36,6 +36,16 @@ key. Two consequences worth stating plainly:
   sentence when the portal lands — it is the thing that makes the claim
   true.
 
+"Nowhere" in that row takes one deliberate call to stay true, and it is worth
+knowing which. `esp_wifi` defaults to `WIFI_STORAGE_FLASH`, so
+`esp_wifi_set_config()` does not merely configure the radio — it writes the
+network name **and password** into the driver's own unencrypted
+`nvs.net80211` namespace, where they would outlive the reboot that ends setup
+mode. `provision.c` calls `esp_wifi_set_storage(WIFI_STORAGE_RAM)` first to
+prevent exactly that. Anyone touching the AP setup path should leave that call
+where it is, or fix this row to match. (Found in review, after the row was
+written and before it was true.)
+
 The hotspot password is the one credential this project deliberately
 **displays**. It is drawn on the panel in large type and printed to the serial
 log, and both are correct: it protects a network that exists for five minutes,

@@ -94,6 +94,9 @@ static const char *TAG = "config";
 #define KEY_HOST       "host"
 #define KEY_PORT       "port"
 
+/* The fingerprint of the credentials that are known to work. See config.h. */
+#define KEY_PROVEN     "proven"
+
 /* Read one string key, and only overwrite `out` if the read fully succeeded.
  *
  * The temporary buffer is the point of this function. nvs_get_str leaves the
@@ -271,6 +274,76 @@ esp_err_t config_save(const app_config_t *cfg, bool save_password)
     ESP_LOGI(TAG, "  host     \"%s\"", cfg->host);
     ESP_LOGI(TAG, "  port     %u", (unsigned)cfg->port);
     return ESP_OK;
+}
+
+/* FNV-1a over the SSID and password, with a separator between them so that
+ * ("ab", "c") and ("a", "bc") do not collide by construction.
+ *
+ * A hash rather than the values themselves because this is a comparison, not a
+ * lookup: nothing ever needs to read it back. It is NOT a security measure and
+ * must not be mistaken for one -- NVS already holds the password in plain text
+ * a few keys away, so this hides nothing that is not already there.
+ *
+ * A collision would mean trusting credentials that had not actually been
+ * proven, which degrades to exactly the behaviour this project had before the
+ * flag existed: the chip waits ten minutes before offering setup mode. At 32
+ * bits over two short strings that is not worth defending against further. */
+static uint32_t wifi_fingerprint(const app_config_t *cfg)
+{
+    uint32_t h = 2166136261u;                 /* FNV offset basis */
+
+    for (const char *p = cfg->ssid; *p != '\0'; p++) {
+        h = (h ^ (uint8_t)*p) * 16777619u;    /* FNV prime */
+    }
+    h = (h ^ 0xFFu) * 16777619u;              /* the separator */
+    for (const char *p = cfg->password; *p != '\0'; p++) {
+        h = (h ^ (uint8_t)*p) * 16777619u;
+    }
+    return h;
+}
+
+bool config_is_proven(const app_config_t *cfg)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;                          /* never provisioned: unproven */
+    }
+
+    uint32_t  stored = 0;
+    esp_err_t err    = nvs_get_u32(h, KEY_PROVEN, &stored);
+    nvs_close(h);
+
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    /* The comparison, not merely the presence of the key. A stored value from
+     * different credentials is not an answer about these ones. */
+    const bool proven = (stored == wifi_fingerprint(cfg));
+    ESP_LOGI(TAG, "wifi credentials %s",
+             proven ? "have connected before"
+                    : "are new or changed -- not yet proven");
+    return proven;
+}
+
+esp_err_t config_mark_proven(const app_config_t *cfg)
+{
+    nvs_handle_t h;
+    esp_err_t    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u32(h, KEY_PROVEN, wifi_fingerprint(cfg));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "these wifi credentials are now recorded as working");
+    }
+    return err;
 }
 
 bool config_is_complete(const app_config_t *cfg)

@@ -195,6 +195,21 @@ static volatile bool s_setup_mode = false;
  * Reset by a success, and only ever read on usage_task. */
 static volatile int s_auth_failures = 0;
 
+/* True when these WiFi credentials have connected successfully at some point
+ * in the past -- not necessarily this boot. Read from NVS at startup, and set
+ * once an IP arrives.
+ *
+ * It is what stops the recovery below from mistaking an outage for a mistake.
+ * Everything else here can only see the current boot, and after a reboot a
+ * router that has been off all night is indistinguishable from a password that
+ * was never right. This is the one piece of evidence that survives, and it
+ * turns "I have never seen this work" into a question that can actually be
+ * answered.
+ *
+ * Written once by usage_task, read by usage_task. The volatile is habit rather
+ * than necessity here. */
+static bool s_config_proven = false;
+
 /* True when the reason we were disconnected points at the password rather than
  * at the world.
  *
@@ -1985,7 +2000,19 @@ static void usage_task(void *arg)
              * between "these settings are wrong" and "the network is having a
              * bad day", and it is the whole reason this is safe to do
              * automatically. */
-            if (!s_ever_connected) {
+            /* Only ever for credentials with nothing to their name.
+             *
+             * A configuration that has connected before is not the reason the
+             * network is missing today, so dropping into setup mode over it
+             * would be both wrong and destructive of the promise stage 8 made:
+             * that this gadget survives the router rebooting overnight without
+             * anyone touching it. Those chips retry forever, exactly as they
+             * did before setup mode existed, and the button is still there for
+             * the day the WiFi genuinely changes.
+             *
+             * That leaves recovery aimed precisely at what it is for: a
+             * password or a network name that has never once worked. */
+            if (!s_ever_connected && !s_config_proven) {
                 const int64_t up_ms = esp_timer_get_time() / 1000;
 
                 if (s_auth_failures >= RECOVER_AUTH_FAILURES) {
@@ -2023,6 +2050,20 @@ static void usage_task(void *arg)
                                 pdFALSE, pdFALSE,
                                 pdMS_TO_TICKS(REFRESH_INTERVAL_MS));
             continue;
+        }
+
+        /* An IP has arrived, so whatever is in the config is right about the
+         * network. Recorded once per boot, and only when it is news -- there is
+         * no reason to spend a flash write saying something NVS already says.
+         *
+         * Here rather than in the event handler because this writes to flash,
+         * which is far too slow to do on the event loop; and after the WiFi
+         * check above rather than after a successful fetch, because this is a
+         * claim about the network credentials and not about the PC. */
+        if (!s_config_proven) {
+            if (config_mark_proven(&s_cfg) == ESP_OK) {
+                s_config_proven = true;
+            }
         }
 
         fetch_once(storage, sizeof(storage));
@@ -2198,6 +2239,11 @@ void app_main(void)
      * falls back to secrets.h, and once the setup portal exists it will mean
      * the chip comes up asking to be configured again. */
     config_load(&s_cfg);
+
+    /* Asked once, at boot, before anything can change the answer. Whether these
+     * credentials have ever worked decides how patient the chip is with them
+     * later -- see s_config_proven. */
+    s_config_proven = config_is_proven(&s_cfg);
 
     /* Assembled once, here, because both the fetch task and its log lines want
      * it and neither should rebuild it. See the comment above s_usage_url for

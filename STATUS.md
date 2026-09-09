@@ -396,6 +396,31 @@ this wrong would have broken a promise the project already keeps:
 Both apply only to a boot that never reached an IP. A link that worked and
 dropped is an outage, and outages are retried forever, as before.
 
+**And both apply only to credentials that have never once worked**, which is a
+second condition added after the first version was reasoned through out loud.
+Per-boot state cannot tell a mistake from an outage across a reboot: a router
+that has been off all night looks exactly like a password that was never right,
+because nothing in RAM survives the restart. So the first time a set of
+credentials succeeds, the chip records that in NVS, and from then on their
+failure is treated as an outage -- `NO WIFI`, retried forever, exactly as
+stage 8 behaved. Without this a dead router would have cycled the gadget
+through ten minutes of trying, five minutes of hotspot, a reboot, and round
+again -- and during each hotspot the station radio is off, so a network coming
+back would not have been noticed for up to five minutes.
+
+What is stored is a **fingerprint of the SSID and password**, not a yes/no
+flag, and that distinction is the whole reason it is trustworthy. A bare flag
+would keep vouching for credentials it had never seen the moment either value
+changed -- through the form, or through a rebuilt `secrets.h` -- which is
+precisely the case that most needs recovery. The host and port are excluded on
+purpose: they have no bearing on joining a network, so correcting the PC's
+address must not discard proof that the WiFi works.
+
+The fingerprint hides nothing and is not meant to: NVS holds the password in
+plain text a few keys away. It is a comparison, not a secret. A collision would
+mean trusting credentials that had not been proven, which degrades to the
+behaviour above rather than to anything worse.
+
 **The network list is buttons, not a `<datalist>`.** The datalist is the
 textbook answer and was wrong here for a reason worth recording: browsers
 *filter* datalist options against whatever the field already contains, and the

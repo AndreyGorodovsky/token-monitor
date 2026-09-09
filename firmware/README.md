@@ -105,13 +105,25 @@ A chip with no usable configuration — no `secrets.h`, nothing in NVS — enter
 setup mode on its own at boot and stays there, with no five-minute timeout,
 because there is nothing for it to time out back to.
 
-**A configuration that cannot connect also comes back here by itself**, so a
-mistyped password cannot strand the gadget: five rejected handshakes, or ten
-minutes without ever reaching the network, and the chip re-enters setup mode
-with `BAD PASSWORD` or `NO NETWORK` on the panel. The ten minutes is
-deliberate slack — "no such network" is also what a router looks like while it
-is still booting after a power cut, and the gadget is supposed to survive that
-unattended.
+**Credentials that have never worked bring the chip back here by itself**, so
+a mistyped password cannot strand the gadget: five rejected handshakes, or ten
+minutes without ever reaching the network, and it re-enters setup mode with
+`BAD PASSWORD` or `NO NETWORK` on the panel.
+
+That only ever applies to WiFi details which have **not once** connected. The
+first time a set of credentials succeeds, the chip records the fact in NVS, and
+from then on it treats their failure as an outage rather than a mistake — it
+sits on `NO WIFI` and retries forever, however long that takes. So switching
+the gadget off overnight and on in the morning does nothing unusual: it tries
+to connect, and if your router is slow or dead it keeps trying rather than
+raising a hotspot at you. The button is still there for the day the WiFi
+genuinely changes.
+
+What gets remembered is a fingerprint of the network name and password, so
+changing either — through this form or a rebuilt `secrets.h` — makes them
+unproven again, and the recovery above applies to them until they work once.
+Changing the PC address does not, since it has nothing to do with joining a
+network.
 
 Two things worth knowing before you try it:
 

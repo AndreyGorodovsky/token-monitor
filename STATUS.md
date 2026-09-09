@@ -447,6 +447,44 @@ stored one), and blank with the box ticked (the network is open; store an empty
 password, which is a value rather than an absence). Ticking the box *and*
 typing a password is refused rather than guessed at.
 
+### The recovery path, verified with a wrong password on purpose
+
+A deliberately wrong password was saved through the form, and the chip found
+its own way back:
+
+```
+config: wifi credentials are new or changed -- not yet proven
+token_monitor: disconnected (reason 202), retry 1 .. retry 5
+token_monitor: disconnected (reason 2), retry 6          <- not counted
+token_monitor: disconnected (reason 202), retry 7
+token_monitor: 6 authentication failures and never connected --
+               the password looks wrong; entering setup mode
+```
+
+47.5 seconds from boot to raising the hotspot unprompted. Three things had to
+be right for that, and each is worth keeping:
+
+- **The fingerprint invalidated the proven flag.** The old password was
+  recorded as working; changing it changed the fingerprint, so the config was
+  untrusted again and recovery was allowed to fire at all. A plain flag would
+  have vouched for the new password and left the chip on `NO WIFI` forever --
+  the exact failure the fingerprint exists to prevent, demonstrated rather than
+  argued.
+- **Reason 202 counted and reason 2 did not.** The tally reached 6 rather than
+  7 because the `AUTH_EXPIRE` at retry 6 was excluded, per the note above that
+  reason 2 is routine at boot on this WPA3 network. Had it counted, the same
+  threshold would be reachable on a perfectly healthy morning.
+- **It fired at 47 s, not at 26 s** where the fifth failure landed, because
+  `usage_task` only re-reads the tally when its 45-second wait expires. Not a
+  fault, but the honest figure is "within a minute via the refresh sleep",
+  not "immediately on the fifth failure".
+
+Restoring the real password produced an unexpectedly clean result: the very
+next boot logged `wifi credentials have connected before`, with no successful
+connection needed first. The proven fingerprint was never deleted -- it was
+keyed to the original SSID and password, so putting them back reproduced it and
+re-earned trust instantly. A boolean flag would have had to start over.
+
 ### The captive portal works, and does not pop up
 
 Everything the firmware controls was verified on hardware:

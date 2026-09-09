@@ -63,9 +63,9 @@ shows everything needed to reach it:
 ```
         SETUP
         WIFI
-   TOKEN-MON-F7CD          <- join this network
+   TOKEN-MON-XXXX          <- join this network (XXXX identifies the board)
         PASS
-      EDJW7QV4             <- with this password
+      XXXXXXXX             <- with this password (new every time)
      192.168.4.1           <- then open this in a browser
     HOLD TO EXIT
         5 MIN              <- it ends by itself after this
